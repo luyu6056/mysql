@@ -1,7 +1,6 @@
 package mysql
 
 import (
-	"bbs/libraries"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
@@ -158,7 +157,7 @@ func (mysqldb *MysqlDB) ping() {
 		case now := <-time.After(time.Second * 10):
 			mysqldb.Conn_m.Range(func(key, v interface{}) bool {
 				if v == nil {
-					libraries.DEBUG("致命错误,range出现nil")
+					DEBUG("致命错误,range出现nil")
 					mysqldb.Lock.Lock()
 					if _, ok := mysqldb.Conn_m.Load(key); ok {
 						mysqldb.Conn_m.Delete(key)
@@ -215,7 +214,7 @@ func (mysqldb *MysqlDB) ping() {
 							case mysqldb.Conn_chan <- conn:
 							case mysqldb.Conn_chan2 <- conn:
 							default:
-								libraries.DEBUG("发生致命错误,mysql conn_num不足，无法新增入库")
+								DEBUG("发生致命错误,mysql conn_num不足，无法新增入库")
 								mysqldb.Conn_m.Delete(conn.Thread_id)
 								atomic.AddInt32(&mysqldb.Conn_num, -1)
 							}
@@ -226,7 +225,7 @@ func (mysqldb *MysqlDB) ping() {
 						}
 					}
 					if mysqldb.Conn_num == 0 {
-						libraries.DEBUG("mysqldb无法创建连接") //断网?
+						DEBUG("mysqldb无法创建连接") //断网?
 					}
 				}()
 
@@ -351,15 +350,15 @@ Loop:
 		case conn = <-mysqldb.Conn_chan:
 			if conn == nil || !conn.Status {
 				conn = nil
-				libraries.DEBUG("从正常池子取出问题conn")
-				libraries.Log("%+v", conn)
+				DEBUG("从正常池子取出问题conn")
+				Log("%+v", conn)
 				continue Loop
 			}
 		case conn = <-mysqldb.Conn_chan2:
 			if conn == nil || !conn.Status {
 				conn = nil
-				libraries.DEBUG("从池子2取出问题conn")
-				libraries.Log("%+v", conn)
+				DEBUG("从池子2取出问题conn")
+				Log("%+v", conn)
 				continue Loop
 			}
 		default: //缓冲为空尝试新建
@@ -373,7 +372,7 @@ Loop:
 					conn = nil
 					continue Loop
 				}
-				//libraries.DEBUG("创建连接")
+				//DEBUG("创建连接")
 			} else { //连接已满，强制等待
 				select {
 				case conn = <-mysqldb.Conn_chan:
@@ -390,12 +389,12 @@ Loop:
 			}
 		}
 		if conn == nil {
-			libraries.DEBUG("取出空的连接")
+			DEBUG("取出空的连接")
 			err = errors.New("取出空的mysql连接")
 			return
 		}
 	}
-	//libraries.DEBUG("GET", conn.Thread_id)
+	//DEBUG("GET", conn.Thread_id)
 	return
 }
 func (mysqldb *MysqlDB) Query(sql []byte, row *MysqlRows) (columns [][]byte, err error) {
@@ -404,7 +403,7 @@ func (mysqldb *MysqlDB) Query(sql []byte, row *MysqlRows) (columns [][]byte, err
 		return nil, err
 	}
 	if conn == nil || conn.Status == false {
-		libraries.DEBUG("取出问题conn")
+		DEBUG("取出问题conn")
 	}
 	columns, err = conn.Query(sql, row)
 	mysqldb.Put(conn)
@@ -416,7 +415,7 @@ func (mysqldb *MysqlDB) Exec(sql []byte) (int64, int64, error) {
 		return 0, 0, err
 	}
 	if conn == nil || conn.Status == false {
-		libraries.DEBUG("取出问题conn")
+		DEBUG("取出问题conn")
 	}
 	l, r, err := conn.Exec(sql)
 	mysqldb.Put(conn)
@@ -442,10 +441,10 @@ func (mysqldb *MysqlDB) EndTransaction(conn *Mysql_Conn) {
 }
 
 func (mysqldb *MysqlDB) Put(conn *Mysql_Conn) {
-	//libraries.DEBUG("Put", conn.Thread_id)
+	//DEBUG("Put", conn.Thread_id)
 	if mysqldb == nil || conn == nil {
-		libraries.DEBUG("mysqldb", mysqldb)
-		libraries.DEBUG("conn", conn)
+		DEBUG("mysqldb", mysqldb)
+		DEBUG("conn", conn)
 		return
 	}
 	if conn.Status {
@@ -458,7 +457,7 @@ func (mysqldb *MysqlDB) Put(conn *Mysql_Conn) {
 			select {
 			case mysqldb.Conn_chan2 <- conn:
 			default: ////两个池都满 不大可能
-				libraries.DEBUG("池子总量", mysqldb.Conn_num)
+				DEBUG("池子总量", mysqldb.Conn_num)
 				conn.Status = false
 				mysqldb.Lock.Lock()
 				if _, ok := mysqldb.Conn_m.Load(conn.Thread_id); ok {
@@ -467,7 +466,7 @@ func (mysqldb *MysqlDB) Put(conn *Mysql_Conn) {
 				}
 				mysqldb.Lock.Unlock()
 				conn.Close()
-				libraries.DEBUG("池子总量", mysqldb.Conn_num)
+				DEBUG("池子总量", mysqldb.Conn_num)
 			}
 		}
 	} else {
@@ -527,7 +526,7 @@ func (mysql *Mysql_Conn) Query(sql []byte, rows *MysqlRows) (columns [][]byte, e
 		return
 	}
 	//mysql.mysqlRows.msg_no = mysql.msg_no
-	//libraries.DEBUG(mysql.buffer.Bytes())
+	//DEBUG(mysql.buffer.Bytes())
 	return columns, nil
 }
 func (mysql *Mysql_Conn) Exec(sql []byte) (lastInsertId int64, rowsAffected int64, err error) {
@@ -543,7 +542,7 @@ func (mysql *Mysql_Conn) Exec(sql []byte) (lastInsertId int64, rowsAffected int6
 	b[3] = 0
 	b[4] = 3
 	copy(b[5:], sql)
-	//libraries.DEBUG(string(sql))
+	//DEBUG(string(sql))
 	_, err = mysql.conn.Write(b)
 	if err != nil {
 		if strings.Contains(err.Error(), "connection reset by peer") {
@@ -810,7 +809,7 @@ func (mysql *Mysql_Conn) readmsg() (rowsAffected, lastInsertId int64, result int
 
 //至少读一条消息
 func (mysql *Mysql_Conn) readOneMsg() (msglen int, err error) {
-	//libraries.DEBUG(mysql.buffer.Bytes())
+	//DEBUG(mysql.buffer.Bytes())
 	for mysql.buffer.Len() < 3 { //至少包含长度
 		err = mysql.read()
 		if err != nil {
@@ -862,7 +861,7 @@ func (mysql *Mysql_Conn) prepare_password(seed, seed2 []byte, passwd string) []b
 	switch mysql.auth_plugin_name {
 	case "mysql_native_password":
 		h := sha1.New()
-		h.Write(libraries.Str2bytes(passwd))
+		h.Write(Str2bytes(passwd))
 		s1 := h.Sum(nil)
 		h.Reset()
 		h.Write(s1)
@@ -879,7 +878,7 @@ func (mysql *Mysql_Conn) prepare_password(seed, seed2 []byte, passwd string) []b
 		return reply
 	case "caching_sha2_password":
 		h := sha256.New()
-		h.Write(libraries.Str2bytes(passwd))
+		h.Write(Str2bytes(passwd))
 		s1 := h.Sum(nil)
 		h.Reset()
 		h.Write(s1)
@@ -912,7 +911,7 @@ func WriteNullmsg(write *MsgBuffer, msg []byte) {
 	write.WriteByte(0)
 }
 func WriteNullTerminatedString(write *MsgBuffer, msg string) {
-	write.Write(libraries.Str2bytes(msg))
+	write.Write(Str2bytes(msg))
 	write.WriteByte(0)
 }
 func ReadLength_Coded_Binary(buf *MsgBuffer) (int, error) {
@@ -956,7 +955,7 @@ func ReadNullTerminatedString(msg *MsgBuffer) (string, error) {
 			break
 		}
 	}
-	return libraries.Bytes2str(b), nil
+	return Bytes2str(b), nil
 }
 
 func ReadLength_Coded_Byte(msg *MsgBuffer) ([]byte, error) {

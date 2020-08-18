@@ -118,16 +118,19 @@ func (conn *Database_mysql_conn) Prepare(query string) (driver.Stmt, error) {
 	buf := bufpool.Get().(*MsgBuffer)
 	defer bufpool.Put(buf)
 	buf.Reset()
-	buf.WriteString("PREPARE ")
+	buf.WriteString("PREPARE sql_")
 	stmt := &Database_mysql_stmt{conn: conn.Mysql_Conn, numInput: strings.Count(query, "?"), query: query}
 	name := atomic.AddUint64(&stmtNo, 1)
 	stmt.name = strconv.FormatUint(name, 10)
 	buf.WriteString(stmt.name)
-	buf.WriteString(" FROM preparable_stmt")
+	buf.WriteString(" FROM '")
+	buf.WriteString(query)
+	buf.WriteString("'")
 	_, _, err := conn.Exec(buf.Bytes()) //start transaction
 	if err != nil {
 		return nil, err
 	}
+
 	return stmt, nil
 }
 func (stmt Database_mysql_stmt) Exec(values []driver.Value) (driver.Result, error) {
@@ -154,7 +157,7 @@ func (stmt Database_mysql_stmt) Exec(values []driver.Value) (driver.Result, erro
 	}
 
 	buf.Reset()
-	buf.WriteString("EXECUTE ")
+	buf.WriteString("EXECUTE sql_")
 	buf.WriteString(stmt.name)
 	if len(values) > 0 {
 		buf.WriteString(" USING ")
@@ -193,7 +196,7 @@ func (stmt Database_mysql_stmt) Query(values []driver.Value) (driver.Rows, error
 	}
 
 	buf.Reset()
-	buf.WriteString("EXECUTE ")
+	buf.WriteString("EXECUTE sql_")
 	buf.WriteString(stmt.name)
 	if len(values) > 0 {
 		buf.WriteString(" USING ")
@@ -205,8 +208,13 @@ func (stmt Database_mysql_stmt) Query(values []driver.Value) (driver.Rows, error
 		buf.Truncate(buf.Len() - 1)
 	}
 	row := rows_pool.Get().(*MysqlRows)
-	_, err := stmt.conn.Query(buf.Bytes(), row)
-	return &Database_rows{r: row, c: stmt.conn}, err
+	columns, err := stmt.conn.Query(buf.Bytes(), row)
+	r := &Database_rows{r: row, c: stmt.conn}
+	r.columns = make([]string, len(columns))
+	for k, v := range columns {
+		r.columns[k] = string(v)
+	}
+	return r, err
 }
 func (stmt Database_mysql_stmt) NumInput() int {
 	return stmt.numInput
@@ -215,7 +223,7 @@ func (stmt Database_mysql_stmt) Close() error {
 	buf := bufpool.Get().(*MsgBuffer)
 	defer bufpool.Put(buf)
 	buf.Reset()
-	buf.WriteString("DROP PREPARE ")
+	buf.WriteString("DROP PREPARE sql_")
 	buf.WriteString(stmt.name)
 	_, _, err := stmt.conn.Exec(buf.Bytes())
 	return err
@@ -271,9 +279,10 @@ func (tx Database_mysql_tx) Rollback() error {
 }
 
 type Database_rows struct {
-	c    *Mysql_Conn
-	r    *MysqlRows
-	line int
+	c       *Mysql_Conn
+	r       *MysqlRows
+	line    int
+	columns []string
 }
 
 func (row *Database_rows) Close() error {
@@ -281,12 +290,7 @@ func (row *Database_rows) Close() error {
 	return nil
 }
 func (row *Database_rows) Columns() []string {
-	res, _ := row.r.Columns(row.c)
-	var r = make([]string, len(res))
-	for k, v := range res {
-		r[k] = string(v)
-	}
-	return r
+	return row.columns
 }
 func (row *Database_rows) Next(dest []driver.Value) (err error) {
 	if row.line >= row.r.result_len {
