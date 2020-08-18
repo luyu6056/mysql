@@ -120,17 +120,18 @@ func (conn *Database_mysql_conn) Prepare(query string) (driver.Stmt, error) {
 	buf.Reset()
 	buf.WriteString("PREPARE sql_")
 	stmt := &Database_mysql_stmt{conn: conn.Mysql_Conn, numInput: strings.Count(query, "?"), query: query}
-	name := atomic.AddUint64(&stmtNo, 1)
-	stmt.name = strconv.FormatUint(name, 10)
-	buf.WriteString(stmt.name)
-	buf.WriteString(" FROM '")
-	buf.WriteString(query)
-	buf.WriteString("'")
-	_, _, err := conn.Exec(buf.Bytes()) //start transaction
-	if err != nil {
-		return nil, err
+	if stmt.numInput > 0 {
+		name := atomic.AddUint64(&stmtNo, 1)
+		stmt.name = strconv.FormatUint(name, 10)
+		buf.WriteString(stmt.name)
+		buf.WriteString(" FROM '")
+		buf.WriteString(query)
+		buf.WriteString("'")
+		_, _, err := conn.Exec(buf.Bytes()) //start transaction
+		if err != nil {
+			return nil, err
+		}
 	}
-
 	return stmt, nil
 }
 func (stmt Database_mysql_stmt) Exec(values []driver.Value) (driver.Result, error) {
@@ -155,19 +156,23 @@ func (stmt Database_mysql_stmt) Exec(values []driver.Value) (driver.Result, erro
 		}
 
 	}
-
 	buf.Reset()
-	buf.WriteString("EXECUTE sql_")
-	buf.WriteString(stmt.name)
-	if len(values) > 0 {
-		buf.WriteString(" USING ")
-		for k, _ := range values {
-			buf.WriteString("@v")
-			buf.WriteString(strconv.Itoa(k))
-			buf.WriteString(",")
+	if stmt.numInput > 0 {
+		buf.WriteString("EXECUTE sql_")
+		buf.WriteString(stmt.name)
+		if len(values) > 0 {
+			buf.WriteString(" USING ")
+			for k, _ := range values {
+				buf.WriteString("@v")
+				buf.WriteString(strconv.Itoa(k))
+				buf.WriteString(",")
+			}
+			buf.Truncate(buf.Len() - 1)
 		}
-		buf.Truncate(buf.Len() - 1)
+	} else {
+		buf.WriteString(stmt.query)
 	}
+
 	var err error
 	stmt.lastInsertId, stmt.rowsAffected, err = stmt.conn.Exec(buf.Bytes())
 	return stmt, err
@@ -196,17 +201,22 @@ func (stmt Database_mysql_stmt) Query(values []driver.Value) (driver.Rows, error
 	}
 
 	buf.Reset()
-	buf.WriteString("EXECUTE sql_")
-	buf.WriteString(stmt.name)
-	if len(values) > 0 {
-		buf.WriteString(" USING ")
-		for k, _ := range values {
-			buf.WriteString("@v")
-			buf.WriteString(strconv.Itoa(k))
-			buf.WriteString(",")
+	if stmt.numInput > 0 {
+		buf.WriteString("EXECUTE sql_")
+		buf.WriteString(stmt.name)
+		if len(values) > 0 {
+			buf.WriteString(" USING ")
+			for k, _ := range values {
+				buf.WriteString("@v")
+				buf.WriteString(strconv.Itoa(k))
+				buf.WriteString(",")
+			}
+			buf.Truncate(buf.Len() - 1)
 		}
-		buf.Truncate(buf.Len() - 1)
+	} else {
+		buf.WriteString(stmt.query)
 	}
+
 	row := rows_pool.Get().(*MysqlRows)
 	columns, err := stmt.conn.Query(buf.Bytes(), row)
 	r := &Database_rows{r: row, c: stmt.conn}
@@ -219,13 +229,15 @@ func (stmt Database_mysql_stmt) Query(values []driver.Value) (driver.Rows, error
 func (stmt Database_mysql_stmt) NumInput() int {
 	return stmt.numInput
 }
-func (stmt Database_mysql_stmt) Close() error {
-	buf := bufpool.Get().(*MsgBuffer)
-	defer bufpool.Put(buf)
-	buf.Reset()
-	buf.WriteString("DROP PREPARE sql_")
-	buf.WriteString(stmt.name)
-	_, _, err := stmt.conn.Exec(buf.Bytes())
+func (stmt Database_mysql_stmt) Close() (err error) {
+	if stmt.numInput > 0 {
+		buf := bufpool.Get().(*MsgBuffer)
+		defer bufpool.Put(buf)
+		buf.Reset()
+		buf.WriteString("DROP PREPARE sql_")
+		buf.WriteString(stmt.name)
+		_, _, err = stmt.conn.Exec(buf.Bytes())
+	}
 	return err
 }
 func (stmt Database_mysql_stmt) LastInsertId() (int64, error) {
