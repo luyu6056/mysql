@@ -7,9 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand"
-	"runtime/debug"
-	"sync/atomic"
 
 	//"fmt"
 
@@ -17,14 +14,10 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 )
 
 const (
-	max_packet_size      = 16777215
-	Default_MaxOpenConns = 20 //默认连接数
-	Default_MaxIdleConns = 10 //默认空链接
+	max_packet_size = 16777215
 )
 
 //capabilities定义
@@ -41,25 +34,6 @@ const (
 	CLIENT_MULTI_RESULTS     = 0x00020000 //1
 	CLIENT_PLUGIN_AUTH       = 0x00080000 //1
 )
-
-type MysqlDB struct {
-	username        string
-	passwd          string
-	database        string
-	ip_port         string
-	charset         string
-	MaxOpenConns    int32            //最大连接数
-	MaxIdleConns    int32            //最大空链接
-	Conn_num        int32            //连接数量统计
-	ConnMaxLifetime int64            //最大连接时间
-	Conn_chan       chan *Mysql_Conn //连接池
-	Conn_chan2      chan *Mysql_Conn //连接池
-	//Ping_chan          chan *Mysql_Conn //ping的中转chan
-	Conn_m    sync.Map //map类型池
-	Lock      sync.Mutex
-	tlsConfig *tls.Config
-	TimeZone  string //新连接会设置时区
-}
 
 type Mysql_Conn struct {
 	//Version            string
@@ -85,201 +59,9 @@ type Mysql_Conn struct {
 	//Debug         bool
 	//buf_4 []byte
 	//wg           sync.WaitGroup
-	pingtime int64
-	Lock     sync.Mutex
 	TimeZone string //database/sql value格式化的时候用到
 }
 
-var pingadd = int64(300) //300秒ping一次
-
-func mysql_open(user, passwd, ip_port, database, charset string, timezone string, tlsConfig *tls.Config) *MysqlDB {
-	db := &MysqlDB{
-		username:  user,
-		passwd:    passwd,
-		ip_port:   ip_port,
-		database:  database,
-		charset:   charset,
-		tlsConfig: tlsConfig,
-		TimeZone:  timezone,
-	}
-
-	return db
-}
-func (mysqldb *MysqlDB) Ping() error {
-	if mysqldb.MaxOpenConns < 1 {
-		mysqldb.MaxOpenConns = Default_MaxOpenConns
-	}
-	if mysqldb.MaxIdleConns < 1 {
-		mysqldb.MaxIdleConns = Default_MaxIdleConns
-	}
-	if mysqldb.MaxIdleConns > mysqldb.MaxOpenConns {
-		mysqldb.MaxIdleConns = mysqldb.MaxOpenConns
-	}
-	mysqldb.Conn_chan = make(chan *Mysql_Conn, mysqldb.MaxIdleConns)
-	mysqldb.Conn_chan2 = make(chan *Mysql_Conn, mysqldb.MaxOpenConns) //预留一些用作ping
-
-	var err error
-
-	for i := int32(0); i < mysqldb.MaxIdleConns; i++ {
-		var conn *Mysql_Conn
-		conn, err = connect_new(mysqldb.username, mysqldb.passwd, mysqldb.ip_port, mysqldb.database, mysqldb.charset, mysqldb.TimeZone, mysqldb.tlsConfig)
-		if err != nil || conn == nil {
-			continue
-		}
-		if conn.Status != true {
-			continue
-		}
-		mysqldb.Conn_chan <- conn
-		mysqldb.Conn_num++
-		mysqldb.Conn_m.Store(conn.Thread_id, conn)
-
-	}
-
-	if len(mysqldb.Conn_chan) == 0 {
-		return errors.New("无法创建数据库连接," + err.Error())
-	}
-
-	go mysqldb.ping()
-	return nil
-}
-func (mysqldb *MysqlDB) ping() {
-
-	defer func() {
-		if err := recover(); err != nil {
-			debug.PrintStack()
-		}
-		if mysqldb != nil {
-			mysqldb.ping()
-		}
-	}()
-	for {
-		select {
-		case now := <-time.After(time.Second * 10):
-			mysqldb.Conn_m.Range(func(key, v interface{}) bool {
-				if v == nil {
-					DEBUG("致命错误,range出现nil")
-					mysqldb.Lock.Lock()
-					if _, ok := mysqldb.Conn_m.Load(key); ok {
-						mysqldb.Conn_m.Delete(key)
-						atomic.AddInt32(&mysqldb.Conn_num, -1)
-					}
-					mysqldb.Lock.Unlock()
-				}
-				return true
-			})
-		pingfor:
-			for {
-				var conn *Mysql_Conn
-				var conn2List []*Mysql_Conn
-				select {
-				case conn = <-mysqldb.Conn_chan: //优先处理Conn1并且把结果放到conn2去
-					if conn = conn.ping(now.Unix(), mysqldb); conn != nil {
-						select {
-						case mysqldb.Conn_chan2 <- conn:
-						default:
-							conn2List = append(conn2List, conn) //conn2满了，放到临时列表
-						}
-					}
-				default:
-					for {
-						select {
-						case conn = <-mysqldb.Conn_chan2: //从conn2拿出来，不会二次ping
-							if conn = conn.ping(now.Unix(), mysqldb); conn != nil {
-								select {
-								case mysqldb.Conn_chan <- conn: //优先放回conn
-								default:
-									conn2List = append(conn2List, conn)
-								}
-							}
-						default:
-							for _, conn := range conn2List {
-								mysqldb.Put(conn) //最终再丢回去
-							}
-							break pingfor
-						}
-
-					}
-					break pingfor
-				}
-
-			}
-			if mysqldb.Conn_num < mysqldb.MaxIdleConns {
-				go func() {
-					for i := int32(0); i < mysqldb.MaxIdleConns; i++ { //避免连接失败一直重试
-						conn, err := connect_new(mysqldb.username, mysqldb.passwd, mysqldb.ip_port, mysqldb.database, mysqldb.charset, mysqldb.TimeZone, mysqldb.tlsConfig)
-						if err == nil && conn != nil && conn.Status {
-							mysqldb.Conn_m.Store(conn.Thread_id, conn)
-							atomic.AddInt32(&mysqldb.Conn_num, 1)
-							select {
-							case mysqldb.Conn_chan <- conn:
-							case mysqldb.Conn_chan2 <- conn:
-							default:
-								DEBUG("发生致命错误,mysql conn_num不足，无法新增入库")
-								mysqldb.Conn_m.Delete(conn.Thread_id)
-								atomic.AddInt32(&mysqldb.Conn_num, -1)
-							}
-
-						}
-						if mysqldb.Conn_num >= mysqldb.MaxIdleConns {
-							break
-						}
-					}
-					if mysqldb.Conn_num == 0 {
-						DEBUG("mysqldb无法创建连接") //断网?
-					}
-				}()
-
-			}
-		}
-	}
-
-}
-func (conn *Mysql_Conn) ping(now int64, db *MysqlDB) *Mysql_Conn {
-
-	if conn.Status == false {
-		conn.Status = false
-		db.Lock.Lock()
-
-		if _, ok := db.Conn_m.Load(conn.Thread_id); ok {
-			db.Conn_m.Delete(conn.Thread_id)
-			atomic.AddInt32(&db.Conn_num, -1)
-		}
-		db.Lock.Unlock()
-		conn.Close()
-		return nil
-	}
-
-	if now > conn.pingtime {
-		conn.msg_no = 255
-		err := conn.writemsg([]byte{0xe})
-		if err != nil {
-			conn.Status = false
-			conn.Close()
-			db.Lock.Lock()
-			if _, ok := db.Conn_m.Load(conn.Thread_id); ok {
-				db.Conn_m.Delete(conn.Thread_id)
-				atomic.AddInt32(&db.Conn_num, -1)
-			}
-			db.Lock.Unlock()
-			return nil
-		}
-		conn.buffer.Reset()
-		_, _, result, _, err := conn.readmsg()
-		if err != nil || result != 0 { //非ok报文或者出错
-			conn.Status = false
-			conn.Close()
-			db.Lock.Lock()
-			if _, ok := db.Conn_m.Load(conn.Thread_id); ok {
-				db.Conn_m.Delete(conn.Thread_id)
-				atomic.AddInt32(&db.Conn_num, -1)
-			}
-			db.Lock.Unlock()
-			return nil
-		}
-		conn.pingtime += pingadd
-	}
-	return conn
-}
 func (mysql *Mysql_Conn) Close() error {
 	if mysql != nil && mysql.conn != nil {
 		mysql.buffer.Reset()
@@ -300,10 +82,9 @@ func (mysql *Mysql_Conn) Close() error {
 	return nil
 }
 func connect_new(username, passwd, ip_port, database, charset, timezone string, tlsconfig *tls.Config) (*Mysql_Conn, error) {
-	now := time.Now().Unix()
+
 	var new_connect = &Mysql_Conn{
 		buffer:   new(MsgBuffer),
-		pingtime: now + rand.Int63n(pingadd), //避免集中ping
 		TimeZone: timezone,
 	}
 	var conn net.Conn
@@ -343,143 +124,8 @@ func connect_new(username, passwd, ip_port, database, charset, timezone string, 
 	}
 	return new_connect, err
 }
-func (mysqldb *MysqlDB) GET() (conn *Mysql_Conn, err error) {
-Loop:
-	for conn == nil {
-		select {
-		case conn = <-mysqldb.Conn_chan:
-			if conn == nil || !conn.Status {
-				conn = nil
-				DEBUG("从正常池子取出问题conn")
-				Log("%+v", conn)
-				continue Loop
-			}
-		case conn = <-mysqldb.Conn_chan2:
-			if conn == nil || !conn.Status {
-				conn = nil
-				DEBUG("从池子2取出问题conn")
-				Log("%+v", conn)
-				continue Loop
-			}
-		default: //缓冲为空尝试新建
-			if mysqldb.Conn_num < mysqldb.MaxOpenConns {
-				atomic.AddInt32(&mysqldb.Conn_num, 1)
-				conn, err = connect_new(mysqldb.username, mysqldb.passwd, mysqldb.ip_port, mysqldb.database, mysqldb.charset, mysqldb.TimeZone, mysqldb.tlsConfig)
-				if err == nil && conn != nil && conn.Status {
-					mysqldb.Conn_m.Store(conn.Thread_id, conn)
-				} else {
-					atomic.AddInt32(&mysqldb.Conn_num, -1)
-					conn = nil
-					continue Loop
-				}
-				//DEBUG("创建连接")
-			} else { //连接已满，强制等待
-				select {
-				case conn = <-mysqldb.Conn_chan:
-					if conn == nil || !conn.Status {
-						conn = nil
-						continue Loop
-					}
-				case conn = <-mysqldb.Conn_chan2:
-					if conn == nil || !conn.Status {
-						conn = nil
-						continue Loop
-					}
-				}
-			}
-		}
-		if conn == nil {
-			DEBUG("取出空的连接")
-			err = errors.New("取出空的mysql连接")
-			return
-		}
-	}
-	//DEBUG("GET", conn.Thread_id)
-	return
-}
-func (mysqldb *MysqlDB) Query(sql []byte, row *MysqlRows) (columns [][]byte, err error) {
-	conn, err := mysqldb.GET()
-	if err != nil {
-		return nil, err
-	}
-	if conn == nil || conn.Status == false {
-		DEBUG("取出问题conn")
-	}
-	columns, err = conn.Query(sql, row)
-	mysqldb.Put(conn)
-	return
-}
-func (mysqldb *MysqlDB) Exec(sql []byte) (int64, int64, error) {
-	conn, err := mysqldb.GET()
-	if err != nil {
-		return 0, 0, err
-	}
-	if conn == nil || conn.Status == false {
-		DEBUG("取出问题conn")
-	}
-	l, r, err := conn.Exec(sql)
-	mysqldb.Put(conn)
-	return l, r, err
-}
 
 var start_transaction = []byte{115, 116, 97, 114, 116, 32, 116, 114, 97, 110, 115, 97, 99, 116, 105, 111, 110}
-
-func (mysqldb *MysqlDB) BeginTransaction() (*Mysql_Conn, error) {
-	conn, err := mysqldb.GET()
-	if err != nil {
-		return nil, err
-	}
-	_, _, err = conn.Exec(start_transaction) //start transaction
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	return conn, nil
-}
-func (mysqldb *MysqlDB) EndTransaction(conn *Mysql_Conn) {
-	mysqldb.Put(conn)
-}
-
-func (mysqldb *MysqlDB) Put(conn *Mysql_Conn) {
-	//DEBUG("Put", conn.Thread_id)
-	if mysqldb == nil || conn == nil {
-		DEBUG("mysqldb", mysqldb)
-		DEBUG("conn", conn)
-		return
-	}
-	if conn.Status {
-		if _, ok := mysqldb.Conn_m.LoadOrStore(conn.Thread_id, conn); !ok {
-			atomic.AddInt32(&mysqldb.Conn_num, 1)
-		}
-		select {
-		case mysqldb.Conn_chan <- conn:
-		default: //缓冲池已满
-			select {
-			case mysqldb.Conn_chan2 <- conn:
-			default: ////两个池都满 不大可能
-				DEBUG("池子总量", mysqldb.Conn_num)
-				conn.Status = false
-				mysqldb.Lock.Lock()
-				if _, ok := mysqldb.Conn_m.Load(conn.Thread_id); ok {
-					mysqldb.Conn_m.Delete(conn.Thread_id)
-					atomic.AddInt32(&mysqldb.Conn_num, -1)
-				}
-				mysqldb.Lock.Unlock()
-				conn.Close()
-				DEBUG("池子总量", mysqldb.Conn_num)
-			}
-		}
-	} else {
-		mysqldb.Lock.Lock()
-		if _, ok := mysqldb.Conn_m.Load(conn.Thread_id); ok {
-			mysqldb.Conn_m.Delete(conn.Thread_id)
-			atomic.AddInt32(&mysqldb.Conn_num, -1)
-		}
-		mysqldb.Lock.Unlock()
-		conn.Close()
-	}
-
-}
 
 func (mysql *Mysql_Conn) Query(sql []byte, rows *MysqlRows) (columns [][]byte, err error) {
 	msglen := len(sql) + 1

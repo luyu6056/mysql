@@ -11,6 +11,7 @@ import (
 	"io/ioutil"
 	"net/url"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,12 +29,12 @@ type MySQLDriver struct{}
 
 //返回一个全新的mysql conn
 func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
-	var str [][]string
-	if str, _ = Preg_match_result(`([^:]+):([^@]*)@(tcp)?(unix)?\(([^)]*)\)\/([^?]+)(\?[^?]+)`, dsn, 1); len(str) == 0 {
-		return nil, errors.New("mysql初始化失败，解析连接字串错误" + dsn)
-
+	r, _ := regexp.Compile(`([^:]+):([^@]*)@(tcp)?(unix)?\(([^)]*)\)\/([^?]+)(\?[^?]+)`)
+	res := r.FindSubmatch([]byte(dsn))
+	var str = make([]string, 8)
+	for k, v := range res {
+		str[k] = string(v)
 	}
-
 	var tlsconfig *tls.Config
 	if Mysql_ssl_ca != "" && Mysql_ssl_cert != "" && Mysql_ssl_key != "" {
 		cert, err := tls.LoadX509KeyPair(Mysql_ssl_cert, Mysql_ssl_key)
@@ -64,8 +65,8 @@ func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
 	} else {
 		time_zone = strconv.Itoa(offset/3600) + ":00"
 	}
-	if str[0][7] != "" {
-		for _, s := range strings.Split(str[0][7], "&") {
+	if str[7] != "" {
+		for _, s := range strings.Split(str[7], "&") {
 			if value := strings.Split(url.PathEscape(s), "="); len(value) == 2 {
 				switch value[0] {
 				case "charset":
@@ -76,7 +77,7 @@ func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
 			}
 		}
 	}
-	conn, err := connect_new(str[0][1], str[0][2], str[0][5], str[0][6], charset, time_zone, tlsconfig)
+	conn, err := connect_new(str[1], str[2], str[5], str[6], charset, time_zone, tlsconfig)
 	return &Database_mysql_conn{conn}, err
 }
 
