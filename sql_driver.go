@@ -29,7 +29,7 @@ type MySQLDriver struct{}
 
 //返回一个全新的mysql conn
 func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
-	r, _ := regexp.Compile(`([^:]+):([^@]*)@(tcp)?(unix)?\(([^)]*)\)\/([^?]+)(\?[^?]+)`)
+	r, _ := regexp.Compile(`([^:]+):(\S*)@(tcp)?(unix)?\(([^)]*)\)\/([^?]+)(\?[^?]+)`)
 	res := r.FindSubmatch([]byte(dsn))
 	var str = make([]string, 8)
 	for k, v := range res {
