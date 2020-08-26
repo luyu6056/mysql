@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 
 	//"fmt"
 
@@ -35,6 +36,62 @@ const (
 	CLIENT_PLUGIN_AUTH       = 0x00080000 //1
 )
 
+type fieldType byte
+
+const (
+	fieldTypeDecimal fieldType = iota
+	fieldTypeTiny
+	fieldTypeShort
+	fieldTypeLong
+	fieldTypeFloat
+	fieldTypeDouble
+	fieldTypeNULL
+	fieldTypeTimestamp
+	fieldTypeLongLong
+	fieldTypeInt24
+	fieldTypeDate
+	fieldTypeTime
+	fieldTypeDateTime
+	fieldTypeYear
+	fieldTypeNewDate
+	fieldTypeVarChar
+	fieldTypeBit
+)
+const (
+	fieldTypeJSON fieldType = iota + 0xf5
+	fieldTypeNewDecimal
+	fieldTypeEnum
+	fieldTypeSet
+	fieldTypeTinyBLOB
+	fieldTypeMediumBLOB
+	fieldTypeLongBLOB
+	fieldTypeBLOB
+	fieldTypeVarString
+	fieldTypeString
+	fieldTypeGeometry
+)
+
+type fieldFlag uint16
+
+const (
+	flagNotNULL fieldFlag = 1 << iota
+	flagPriKey
+	flagUniqueKey
+	flagMultipleKey
+	flagBLOB
+	flagUnsigned
+	flagZeroFill
+	flagBinary
+	flagEnum
+	flagAutoIncrement
+	flagTimestamp
+	flagSet
+	flagUnknown1
+	flagUnknown2
+	flagUnknown3
+	flagUnknown4
+)
+
 type Mysql_Conn struct {
 	//Version            string
 	Thread_id uint32 //线程ID
@@ -59,7 +116,7 @@ type Mysql_Conn struct {
 	//Debug         bool
 	//buf_4 []byte
 	//wg           sync.WaitGroup
-	TimeZone string //database/sql value格式化的时候用到
+	loc *time.Location //database/sql value格式化的时候用到
 }
 
 func (mysql *Mysql_Conn) Close() error {
@@ -81,11 +138,11 @@ func (mysql *Mysql_Conn) Close() error {
 	mysql.Status = false
 	return nil
 }
-func connect_new(username, passwd, ip_port, database, charset, timezone string, tlsconfig *tls.Config) (*Mysql_Conn, error) {
+func connect_new(username, passwd, ip_port, database, charset string, timezone *time.Location, tlsconfig *tls.Config) (*Mysql_Conn, error) {
 
 	var new_connect = &Mysql_Conn{
-		buffer:   new(MsgBuffer),
-		TimeZone: timezone,
+		buffer: new(MsgBuffer),
+		loc:    timezone,
 	}
 	var conn net.Conn
 	if strings.Contains(ip_port, ".sock") {
@@ -120,14 +177,22 @@ func connect_new(username, passwd, ip_port, database, charset, timezone string, 
 	if err != nil {
 		new_connect.Status = false
 	} else {
-		_, _, err = new_connect.Exec([]byte("set time_zone='" + timezone + "'"))
+		_, offset := time.Now().In(new_connect.loc).Zone()
+		var time_zone string
+		if offset >= 0 {
+			time_zone = "+" + strconv.Itoa(offset/3600) + ":00"
+		} else {
+			time_zone = strconv.Itoa(offset/3600) + ":00"
+		}
+		_, _, err = new_connect.Exec([]byte("set time_zone='" + time_zone + "'"))
 	}
 	return new_connect, err
 }
 
 var start_transaction = []byte{115, 116, 97, 114, 116, 32, 116, 114, 97, 110, 115, 97, 99, 116, 105, 111, 110}
 
-func (mysql *Mysql_Conn) Query(sql []byte, rows *MysqlRows) (columns [][]byte, err error) {
+func (mysql *Mysql_Conn) Query(sql []byte, rows *MysqlRows) (columns []string, err error) {
+
 	msglen := len(sql) + 1
 	if msglen > max_packet_size {
 		err = errors.New("消息大于最大长度" + strconv.Itoa(max_packet_size))
@@ -176,6 +241,7 @@ func (mysql *Mysql_Conn) Query(sql []byte, rows *MysqlRows) (columns [][]byte, e
 	return columns, nil
 }
 func (mysql *Mysql_Conn) Exec(sql []byte) (lastInsertId int64, rowsAffected int64, err error) {
+
 	msglen := len(sql) + 1
 	if msglen > max_packet_size {
 		err = errors.New("消息大于最大长度" + strconv.Itoa(max_packet_size))
@@ -423,7 +489,9 @@ func (mysql *Mysql_Conn) readmsg() (rowsAffected, lastInsertId int64, result int
 		if err != nil {
 			return
 		}
+
 		mysql.buffer.Shift(4)
+
 		//mysql.serverStatus = binary.LittleEndian.Uint16(mysql.buffer.Next(2))
 		if err != nil {
 			return
@@ -551,6 +619,24 @@ func Write1lenmsg(write *MsgBuffer, msg []byte) {
 	}
 	write.WriteByte(uint8(msglen))
 	write.Write(msg)
+}
+func Writelenmsg(write *MsgBuffer, msg []byte) {
+	n := len(msg)
+	switch {
+	case n <= 250:
+		write.WriteByte(byte(n))
+	case n <= 0xffff:
+		b := write.Make(3)
+		b[0], b[1], b[2] = 0xfc, byte(n), byte(n>>8)
+	case n <= 0xffffff:
+		b := write.Make(4)
+		b[0], b[1], b[2], b[3] = 0xfd, byte(n), byte(n>>8), byte(n>>16)
+	default:
+		b := write.Make(9)
+		b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8] = 0xfe, byte(n), byte(n>>8), byte(n>>16), byte(n>>24), byte(n>>32), byte(n>>40), byte(n>>48), byte(n>>56)
+	}
+	write.Write(msg)
+
 }
 func WriteNullmsg(write *MsgBuffer, msg []byte) {
 	write.Write(msg)

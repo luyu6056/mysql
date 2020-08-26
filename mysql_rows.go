@@ -24,18 +24,16 @@ type MysqlRows struct {
 	msg_len   []int
 	buffer    []byte
 	//msg_buffer_no *int
-	field      []byte
-	field_m    map[string]map[string]*Field_struct
-	fields     [][]byte
+
+	field_m map[string]map[string]*Field_struct
+
 	result_len int
 }
 
-func (row *MysqlRows) Columns(mysql *Mysql_Conn) (columns [][]byte, err error) {
-	if cap(row.fields) < row.field_len {
-		row.fields = make([][]byte, 0, row.field_len)
-	}
+func (row *MysqlRows) Columns(mysql *Mysql_Conn) (columns []string, err error) {
+
 	row.result_len = 0
-	columns = row.fields[:row.field_len]
+	columns = make([]string, row.field_len)
 	var index uint32
 	var def string
 	var msglen, field_index int
@@ -72,11 +70,7 @@ func (row *MysqlRows) Columns(mysql *Mysql_Conn) (columns [][]byte, err error) {
 		if err != nil {
 			return
 		}
-		if field_index+msglen > len(row.field) {
-			row.field = append(row.field, make([]byte, msglen)...)
-		}
-		columns[index] = row.field[field_index : field_index+msglen]
-		copy(columns[index], row.Buffer.Next(msglen))
+		columns[index] = string(row.Buffer.Next(msglen))
 		field_index += msglen
 		index++
 	}
