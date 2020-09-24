@@ -61,7 +61,11 @@ func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
 	}
 
 	var charset = "utf8"
-	loc := time.UTC
+	var mysqlconn = &Mysql_Conn{
+		buffer: new(MsgBuffer),
+		loc:    time.UTC,
+	}
+
 	if str[7] != "" {
 		for _, s := range strings.Split(str[7], "&") {
 			if value := strings.Split(url.PathEscape(s), "="); len(value) == 2 {
@@ -70,14 +74,21 @@ func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
 					charset = value[1]
 				case "loc":
 					if newloc, err := time.LoadLocation(value[1]); err == nil {
-						loc = newloc
+						mysqlconn.loc = newloc
+					}
+				case "parseTime":
+					var isBool bool
+					mysqlconn.parseTime, isBool = readBool(value[1])
+					if !isBool {
+						return nil, errors.New("invalid bool value: " + value[1])
+
 					}
 				}
 			}
 		}
 	}
-	conn, err := connect_new(str[1], str[2], str[5], str[6], charset, loc, tlsconfig)
-	return &Database_mysql_conn{Mysql_Conn: conn, stmtCache: make(map[string]*Database_mysql_stmt)}, err
+	err := mysqlconn.connect_new(str[1], str[2], str[5], str[6], charset, tlsconfig)
+	return &Database_mysql_conn{Mysql_Conn: mysqlconn, stmtCache: make(map[string]*Database_mysql_stmt)}, err
 
 }
 
@@ -120,7 +131,6 @@ type Database_mysql_stmt struct {
 
 func (conn *Database_mysql_conn) Prepare(query string) (driver.Stmt, error) {
 	conn.stmtMutex.RLock()
-
 	if stmt, exists := conn.stmtCache[query]; exists {
 		// must update reference counter in lock scope
 		atomic.AddInt32(&stmt.ref, 1)
@@ -169,7 +179,7 @@ func (conn *Database_mysql_conn) Prepare(query string) (driver.Stmt, error) {
 		return nil, err
 	}
 
-	buffer := conn.Mysql_Conn.buffer.Bytes()[:msglen]
+	buffer := conn.Mysql_Conn.buffer.Next(msglen)
 	switch buffer[0] {
 	case 0: //ok报文
 
@@ -179,18 +189,18 @@ func (conn *Database_mysql_conn) Prepare(query string) (driver.Stmt, error) {
 
 	case 255: //err报文
 
-		conn.Mysql_Conn.buffer.Next(1)
-		b := conn.Mysql_Conn.buffer.Next(2)
-		errcode := int(b[0]) | int(b[1])<<8
+		var msg string
+		errcode := int(buffer[1]) | int(buffer[2])<<8
 		if conn.Mysql_Conn.Status { //未连接成功之前
-			conn.Mysql_Conn.buffer.Shift(6)
+			msg = string(buffer[9:])
+		} else {
+			msg = string(buffer[3:])
 		}
-		msg, err := ioutil.ReadAll(conn.Mysql_Conn.buffer)
 		if err != nil {
 
 			return nil, err
 		}
-		return nil, errors.New(strconv.Itoa(errcode) + "-" + string(msg))
+		return nil, errors.New(strconv.Itoa(errcode) + "-" + msg)
 	default:
 		return nil, errors.New("无法识别StmtPrepare报文" + strconv.Itoa(int(buffer[0])))
 	}
@@ -221,21 +231,22 @@ func (stmt Database_mysql_stmt) Exec(args []driver.Value) (driver.Result, error)
 
 	return stmt, err
 }
-func (stmt Database_mysql_stmt) Query(args []driver.Value) (driver.Rows, error) {
-	if len(args) != stmt.numInput {
-		return nil, errors.New("预处理传入的参数数量不对，语句:" + stmt.query + ",参数数量:" + strconv.Itoa(stmt.numInput))
-	}
+func (stmt *Database_mysql_stmt) Query(args []driver.Value) (driver.Rows, error) {
+
 	var errmsg string
-	var columns []string
 	var err error
 	row := rows_pool.Get().(*MysqlRows)
 	if stmt.numInput == -1 {
-		columns, err = stmt.conn.Query(Str2bytes(stmt.query), row)
+		err = stmt.conn.Query(Str2bytes(stmt.query), row)
+
 		if err != nil {
 			rows_pool.Put(row)
 			return nil, err
 		}
 	} else {
+		if len(args) != stmt.numInput {
+			return nil, errors.New("预处理传入的参数数量不对，语句:" + stmt.query + ",参数数量:" + strconv.Itoa(stmt.numInput))
+		}
 		err = stmt.Execute(args)
 		if err != nil {
 			rows_pool.Put(row)
@@ -243,6 +254,7 @@ func (stmt Database_mysql_stmt) Query(args []driver.Value) (driver.Rows, error) 
 		}
 		stmt.conn.Mysql_Conn.buffer.Reset()
 		_, _, row.field_len, errmsg, err = stmt.conn.Mysql_Conn.readmsg()
+
 		if errmsg != "" {
 			err = errors.New(errmsg)
 		}
@@ -250,16 +262,17 @@ func (stmt Database_mysql_stmt) Query(args []driver.Value) (driver.Rows, error) 
 			rows_pool.Put(row)
 			return nil, err
 		}
-		columns, err = row.Columns(stmt.conn.Mysql_Conn)
+		err = row.Columns(stmt.conn.Mysql_Conn)
 		if err != nil {
 			rows_pool.Put(row)
 			return nil, err
 		}
 	}
 
-	return &Database_rows{r: row, c: stmt.conn, columns: columns}, err
+	return &Database_rows{r: row, stmt: stmt}, err
 }
 func (stmt Database_mysql_stmt) Execute(args []driver.Value) error {
+
 	var err error
 	conn := stmt.conn.Mysql_Conn
 	buf := bufpool.Get().(*MsgBuffer)
@@ -462,46 +475,243 @@ func (tx Database_mysql_tx) Rollback() error {
 }
 
 type Database_rows struct {
-	c       *Database_mysql_conn
-	r       *MysqlRows
-	line    int
-	columns []string
+	r    *MysqlRows
+	stmt *Database_mysql_stmt
+	line int
 }
 
 func (row *Database_rows) Close() error {
+
 	rows_pool.Put(row.r)
 	return nil
 }
-func (row *Database_rows) Columns() []string {
-	return row.columns
+func (row *Database_rows) Columns() (columns []string) {
+	columns = make([]string, len(row.r.columns))
+	for k, v := range row.r.columns {
+		columns[k] = v.name
+	}
+	return
 }
 func (row *Database_rows) Next(dest []driver.Value) (err error) {
 	if row.line >= row.r.result_len {
 		return io.EOF
 	}
-	rows := row.r
-	msglen := rows.msg_len[row.line]
-	rows.Buffer2.Reset()
-	rows.Buffer2.Write(rows.Buffer.Next(msglen))
-	for k, _ := range dest {
-		rows.buffer, err = ReadLength_Coded_Byte(rows.Buffer2)
-		if err != nil {
-			return
-		}
-		dest[k] = string(rows.buffer)
-	}
 
+	rows := row.r
+	if row.stmt.numInput == -1 {
+
+		data := rows.Buffer.Next(rows.msg_len[row.line])
+		pos := 0
+		for i, _ := range dest {
+			msglen, err := ReadLength_Coded_Slice(data[pos:], &pos)
+			if err != nil {
+				if err.Error() == "NULL" {
+					dest[i] = nil
+					continue
+				}
+				return err
+			}
+			str := Bytes2str(data[pos : pos+msglen])
+
+			switch rows.columns[i].fieldtype {
+			case fieldTypeNULL:
+				dest[i] = nil
+
+			// Numeric Types
+			case fieldTypeTiny:
+				dest[i], _ = strconv.ParseInt(str, 10, 8)
+
+			case fieldTypeShort, fieldTypeYear:
+				dest[i], _ = strconv.ParseInt(str, 10, 16)
+
+			case fieldTypeInt24, fieldTypeLong:
+				dest[i], _ = strconv.ParseInt(str, 10, 32)
+
+			case fieldTypeLongLong:
+				dest[i], _ = strconv.ParseInt(str, 10, 64)
+
+			case fieldTypeFloat:
+				dest[i], _ = strconv.ParseFloat(str, 32)
+
+			case fieldTypeDouble:
+				dest[i], _ = strconv.ParseFloat(str, 64)
+
+			// Length coded Binary Strings
+			case fieldTypeDecimal, fieldTypeNewDecimal, fieldTypeVarChar,
+				fieldTypeBit, fieldTypeEnum, fieldTypeSet, fieldTypeTinyBLOB,
+				fieldTypeMediumBLOB, fieldTypeLongBLOB, fieldTypeBLOB,
+				fieldTypeVarString, fieldTypeString, fieldTypeGeometry, fieldTypeJSON:
+				dest[i] = string(data[pos : pos+msglen])
+			case
+				fieldTypeDate, fieldTypeNewDate, // Date YYYY-MM-DD
+				fieldTypeTime,                         // Time [-][H]HH:MM:SS[.fractal]
+				fieldTypeTimestamp, fieldTypeDateTime: // Timestamp YYYY-MM-DD HH:MM:SS[.fractal]
+				dest[i], _ = time.ParseInLocation("2006-01-02 15:04:05", str, row.stmt.conn.loc)
+
+			// Please report if this happens!
+			default:
+				return fmt.Errorf("unknown field type %d", rows.columns[i].fieldtype)
+			}
+
+			pos += msglen
+
+		}
+	} else {
+
+		nulllen := (len(dest) + 7 + 2) / 8
+		msglen := rows.msg_len[row.line]
+		data := rows.Buffer.Next(msglen)
+
+		if msglen == 5 && data[0] == 0xfe { //EOF
+			return io.EOF
+		}
+		if data[0] != 0 {
+			return errors.New("返回协议错误，返回的内容不是Binary Protocol")
+		}
+		pos := 1 + nulllen
+		nullMask := data[1 : 1+pos]
+		for i, _ := range dest {
+			if nullMask[i/8]>>(uint(i)&7) == 1 {
+				dest[i] = nil
+				continue
+			}
+
+			// Convert to byte-coded string
+			switch rows.columns[i].fieldtype {
+			case fieldTypeNULL:
+				dest[i] = nil
+				continue
+
+			// Numeric Types
+			case fieldTypeTiny:
+				if rows.columns[i].fleldflag&flagUnsigned != 0 {
+					dest[i] = int64(data[pos])
+				} else {
+					dest[i] = int64(int8(data[pos]))
+				}
+				pos++
+				continue
+
+			case fieldTypeShort, fieldTypeYear:
+				if rows.columns[i].fleldflag&flagUnsigned != 0 {
+					dest[i] = int64(binary.LittleEndian.Uint16(data[pos : pos+2]))
+				} else {
+					dest[i] = int64(int16(binary.LittleEndian.Uint16(data[pos : pos+2])))
+				}
+				pos += 2
+				continue
+
+			case fieldTypeInt24, fieldTypeLong:
+				if rows.columns[i].fleldflag&flagUnsigned != 0 {
+					dest[i] = int64(binary.LittleEndian.Uint32(data[pos : pos+4]))
+				} else {
+					dest[i] = int64(int32(binary.LittleEndian.Uint32(data[pos : pos+4])))
+				}
+				pos += 4
+				continue
+
+			case fieldTypeLongLong:
+				if rows.columns[i].fleldflag&flagUnsigned != 0 {
+					val := binary.LittleEndian.Uint64(data[pos : pos+8])
+					if val > math.MaxInt64 {
+						dest[i] = uint64ToString(val)
+					} else {
+						dest[i] = int64(val)
+					}
+				} else {
+					dest[i] = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
+				}
+				pos += 8
+				continue
+
+			case fieldTypeFloat:
+				dest[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[pos : pos+4]))
+				pos += 4
+				continue
+
+			case fieldTypeDouble:
+				dest[i] = math.Float64frombits(binary.LittleEndian.Uint64(data[pos : pos+8]))
+				pos += 8
+				continue
+
+			// Length coded Binary Strings
+			case fieldTypeDecimal, fieldTypeNewDecimal, fieldTypeVarChar,
+				fieldTypeBit, fieldTypeEnum, fieldTypeSet, fieldTypeTinyBLOB,
+				fieldTypeMediumBLOB, fieldTypeLongBLOB, fieldTypeBLOB,
+				fieldTypeVarString, fieldTypeString, fieldTypeGeometry, fieldTypeJSON:
+
+				msglen, err := ReadLength_Coded_Slice(data[pos:], &pos)
+				if err != nil {
+
+					return err
+				}
+				dest[i] = string(data[pos : pos+msglen])
+				pos += msglen
+			case
+				fieldTypeDate, fieldTypeNewDate, // Date YYYY-MM-DD
+				fieldTypeTime,                         // Time [-][H]HH:MM:SS[.fractal]
+				fieldTypeTimestamp, fieldTypeDateTime: // Timestamp YYYY-MM-DD HH:MM:SS[.fractal]
+
+				n, err := ReadLength_Coded_Slice(data[pos:], &pos)
+				if err != nil {
+
+					return err
+				}
+
+				switch {
+				case msglen == 0:
+					dest[i] = nil
+					continue
+				case rows.columns[i].fieldtype == fieldTypeTime:
+					// database/sql does not support an equivalent to TIME, return a string
+					var dstlen uint8
+					switch decimals := rows.columns[i].decimals; decimals {
+					case 0x00, 0x1f:
+						dstlen = 8
+					case 1, 2, 3, 4, 5, 6:
+						dstlen = 8 + 1 + decimals
+					default:
+						return fmt.Errorf(
+							"protocol error, illegal decimals value %d",
+							rows.columns[i].decimals,
+						)
+					}
+					dest[i], err = formatBinaryTime(data[pos:pos+int(n)], dstlen)
+				case row.stmt.conn.Mysql_Conn.parseTime:
+					dest[i], err = parseBinaryDateTime(uint64(n), data[pos:], row.stmt.conn.Mysql_Conn.loc)
+				default:
+					var dstlen uint8
+					if rows.columns[i].fieldtype == fieldTypeDate {
+						dstlen = 10
+					} else {
+						switch decimals := rows.columns[i].decimals; decimals {
+						case 0x00, 0x1f:
+							dstlen = 19
+						case 1, 2, 3, 4, 5, 6:
+							dstlen = 19 + 1 + decimals
+						default:
+							return fmt.Errorf(
+								"protocol error, illegal decimals value %d",
+								rows.columns[i].decimals,
+							)
+						}
+					}
+					dest[i], err = formatBinaryDateTime(data[pos:pos+int(n)], dstlen)
+				}
+
+				if err != nil {
+					pos += int(n)
+					continue
+				} else {
+					return err
+				}
+
+			// Please report if this happens!
+			default:
+				return fmt.Errorf("unknown field type %d", rows.columns[i].fieldtype)
+			}
+		}
+	}
 	row.line++
 	return
-}
-
-func uint64ToBytes(n uint64, b []byte) {
-	b[0] = byte(n)
-	b[1] = byte(n >> 8)
-	b[2] = byte(n >> 16)
-	b[3] = byte(n >> 24)
-	b[4] = byte(n >> 32)
-	b[5] = byte(n >> 40)
-	b[6] = byte(n >> 48)
-	b[7] = byte(n >> 56)
 }

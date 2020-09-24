@@ -116,7 +116,8 @@ type Mysql_Conn struct {
 	//Debug         bool
 	//buf_4 []byte
 	//wg           sync.WaitGroup
-	loc *time.Location //database/sql value格式化的时候用到
+	loc       *time.Location //database/sql value格式化的时候用到
+	parseTime bool
 }
 
 func (mysql *Mysql_Conn) Close() error {
@@ -138,60 +139,56 @@ func (mysql *Mysql_Conn) Close() error {
 	mysql.Status = false
 	return nil
 }
-func connect_new(username, passwd, ip_port, database, charset string, timezone *time.Location, tlsconfig *tls.Config) (*Mysql_Conn, error) {
+func (mysqlconn *Mysql_Conn) connect_new(username, passwd, ip_port, database, charset string, tlsconfig *tls.Config) error {
 
-	var new_connect = &Mysql_Conn{
-		buffer: new(MsgBuffer),
-		loc:    timezone,
-	}
 	var conn net.Conn
 	if strings.Contains(ip_port, ".sock") {
 		addr, err := net.ResolveUnixAddr("unix", ip_port[:strings.Index(ip_port, ".sock")+5])
 		if err != nil {
-			return nil, err
+			return err
 		}
 		conn, err = net.DialUnix("unix", nil, addr)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	} else {
 		tcpAddr, err := net.ResolveTCPAddr("tcp4", ip_port)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		conn, err = net.DialTCP("tcp", nil, tcpAddr)
 
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
-	new_connect.conn = conn
+	mysqlconn.conn = conn
 	//new_connect.buf_4 = make([]byte, 4)
 	//new_connect.buf_exec = []byte{0, 0, 0, 0, 3}
-	err, seed, seed2 := new_connect.handshakePacket()
+	err, seed, seed2 := mysqlconn.handshakePacket()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	err = new_connect.handshakeResponse(seed, seed2, username, passwd, database, charset, tlsconfig)
+	err = mysqlconn.handshakeResponse(seed, seed2, username, passwd, database, charset, tlsconfig)
 	if err != nil {
-		new_connect.Status = false
+		mysqlconn.Status = false
 	} else {
-		_, offset := time.Now().In(new_connect.loc).Zone()
+		_, offset := time.Now().In(mysqlconn.loc).Zone()
 		var time_zone string
 		if offset >= 0 {
 			time_zone = "+" + strconv.Itoa(offset/3600) + ":00"
 		} else {
 			time_zone = strconv.Itoa(offset/3600) + ":00"
 		}
-		_, _, err = new_connect.Exec([]byte("set time_zone='" + time_zone + "'"))
+		_, _, err = mysqlconn.Exec([]byte("set time_zone='" + time_zone + "'"))
 	}
-	return new_connect, err
+	return err
 }
 
 var start_transaction = []byte{115, 116, 97, 114, 116, 32, 116, 114, 97, 110, 115, 97, 99, 116, 105, 111, 110}
 
-func (mysql *Mysql_Conn) Query(sql []byte, rows *MysqlRows) (columns []string, err error) {
+func (mysql *Mysql_Conn) Query(sql []byte, rows *MysqlRows) (err error) {
 
 	msglen := len(sql) + 1
 	if msglen > max_packet_size {
@@ -230,7 +227,7 @@ func (mysql *Mysql_Conn) Query(sql []byte, rows *MysqlRows) (columns []string, e
 		mysql.Close()
 		return
 	}
-	columns, err = rows.Columns(mysql)
+	err = rows.Columns(mysql)
 	if err != nil {
 		mysql.Status = false
 		mysql.Close()
@@ -238,7 +235,7 @@ func (mysql *Mysql_Conn) Query(sql []byte, rows *MysqlRows) (columns []string, e
 	}
 	//mysql.mysqlRows.msg_no = mysql.msg_no
 	//DEBUG(mysql.buffer.Bytes())
-	return columns, nil
+	return nil
 }
 func (mysql *Mysql_Conn) Exec(sql []byte) (lastInsertId int64, rowsAffected int64, err error) {
 
@@ -283,13 +280,18 @@ func (mysql *Mysql_Conn) Exec(sql []byte) (lastInsertId int64, rowsAffected int6
 }
 
 //一次性读取n个字节
-const mysqlmsglen = 16384
 
-func (mysql *Mysql_Conn) read() error {
+func (mysql *Mysql_Conn) read(need int) error {
+
 	olen := mysql.buffer.Len()
-	n, err := mysql.conn.Read(mysql.buffer.Make(mysqlmsglen))
+	n, err := mysql.conn.Read(mysql.buffer.Make(need))
+	if err != nil {
+		mysql.buffer.Truncate(olen)
+		return err
+	}
 	mysql.buffer.Truncate(olen + n)
-	return err
+
+	return nil
 }
 
 //握手包
@@ -523,25 +525,25 @@ func (mysql *Mysql_Conn) readmsg() (rowsAffected, lastInsertId int64, result int
 
 //至少读一条消息
 func (mysql *Mysql_Conn) readOneMsg() (msglen int, err error) {
-	//DEBUG(mysql.buffer.Bytes())
-	for mysql.buffer.Len() < 3 { //至少包含长度
-		err = mysql.read()
+
+	for mysql.buffer.Len() < 4 { //至少包含长度
+		err = mysql.read(16384) //读取一定字节
 		if err != nil {
 			return
 		}
 	}
-	b := mysql.buffer.Next(3)
+	b := mysql.buffer.Next(4)
 	msglen = int(b[0]) | int(b[1])<<8 | int(b[2])<<16
 	if msglen > max_packet_size {
 		return 0, errors.New("EOF")
 	}
-	for mysql.buffer.Len() < msglen+1 { //至少包含一条消息的长度
-		err = mysql.read()
+	for mysql.buffer.Len() < msglen { //至少包含一条消息的长度
+		err = mysql.read(msglen - mysql.buffer.Len())
 		if err != nil {
 			return 0, err
 		}
 	}
-	mysql.msg_no = mysql.buffer.Next(1)[0]
+	mysql.msg_no = b[3]
 	return
 }
 func (mysql *Mysql_Conn) writemsg(msg []byte) error {
@@ -674,6 +676,38 @@ func ReadLength_Coded_Binary(buf *MsgBuffer) (int, error) {
 		}
 		b := buf.Next(8)
 		return int(b[0]) | int(b[1])<<8 | int(b[2])<<16 | int(b[3])<<24 | int(b[4])<<32 | int(b[5])<<40 | int(b[6])<<48 | int(b[7])<<56, nil
+	}
+	return 0, nil
+}
+func ReadLength_Coded_Slice(data []byte, pos *int) (l int, err error) {
+	if len(data) == 0 {
+		return 0, errors.New("ReadLength_Coded_Slice err: buff length 0")
+	}
+	switch {
+	case data[0] < 251:
+		*pos++
+		return int(data[0]), nil
+	case data[0] == 251:
+		*pos++
+		return 0, errors.New("NULL")
+	case data[0] == 252:
+		if len(data) < 2 {
+			return 0, errors.New("ReadLength_Coded_Slice err1")
+		}
+		*pos = *pos + 3
+		return int(data[1]) | int(data[2])<<8, nil
+	case data[0] == 253:
+		if len(data) < 3 {
+			return 0, errors.New("ReadLength_Coded_Slice err2")
+		}
+		*pos = *pos + 4
+		return int(data[1]) | int(data[2])<<8 | int(data[3])<<16, nil
+	case data[0] == 254:
+		if len(data) < 8 {
+			return 0, errors.New("ReadLength_Coded_Slice err3")
+		}
+		*pos = *pos + 9
+		return int(data[1]) | int(data[2])<<8 | int(data[3])<<16 | int(data[4])<<24 | int(data[5])<<32 | int(data[6])<<40 | int(data[7])<<48 | int(data[8])<<56, nil
 	}
 	return 0, nil
 }
