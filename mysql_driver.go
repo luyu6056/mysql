@@ -11,7 +11,6 @@ import (
 
 	//"fmt"
 
-	"io/ioutil"
 	"net"
 	"strconv"
 	"strings"
@@ -24,16 +23,16 @@ const (
 //capabilities定义
 const (
 	CLIENT_LONG_PASSWORD     = 0x00000001
-	CLIENT_LONG_FLAG         = 0x00000004 //1
-	CLIENT_CONNECT_WITH_DB   = 0x00000008 //1
+	CLIENT_LONG_FLAG         = 0x00000004
+	CLIENT_CONNECT_WITH_DB   = 0x00000008
 	CLIENT_COMPRESS          = 0x00000020
-	CLIENT_LOCAL_FILES       = 0x00000080 //1
-	CLIENT_PROTOCOL_41       = 0x00000200 //1
+	CLIENT_LOCAL_FILES       = 0x00000080
+	CLIENT_PROTOCOL_41       = 0x00000200
 	CLIENT_SSL               = 0x00000800
-	CLIENT_SECURE_CONNECTION = 0x00008000 //1
-	CLIENT_TRANSACTIONS      = 0x00002000 //1
-	CLIENT_MULTI_RESULTS     = 0x00020000 //1
-	CLIENT_PLUGIN_AUTH       = 0x00080000 //1
+	CLIENT_SECURE_CONNECTION = 0x00008000
+	CLIENT_TRANSACTIONS      = 0x00002000
+	CLIENT_MULTI_RESULTS     = 0x00020000
+	CLIENT_PLUGIN_AUTH       = 0x00080000
 )
 
 type fieldType byte
@@ -108,9 +107,9 @@ type Mysql_Conn struct {
 	//username      string
 	//passwd        string
 	//database      string
-	msg_no uint8
-	conn   net.Conn
-	buffer *MsgBuffer
+	msg_no                  uint8
+	conn                    net.Conn
+	readBuffer, writeBuffer *MsgBuffer
 	//msg_buffer_no int
 
 	//Debug         bool
@@ -122,16 +121,17 @@ type Mysql_Conn struct {
 
 func (mysql *Mysql_Conn) Close() error {
 	if mysql != nil && mysql.conn != nil {
-		mysql.buffer.Reset()
-		b := mysql.buffer.Make(5)
+		mysql.writeBuffer.Reset()
+		b := mysql.writeBuffer.Make(7)
 		b[0] = 1
 		b[1] = 0
 		b[2] = 0
 		b[3] = 0
 		b[4] = 1 //COM_QUIT
-		mysql.buffer.WriteByte(0)
-		mysql.buffer.WriteByte(0x01)
-		mysql.conn.Write(mysql.buffer.Bytes())
+		b[5] = 0
+		b[6] = 1
+
+		mysql.conn.Write(b)
 
 		mysql.conn.Close()
 		mysql.conn = nil
@@ -195,7 +195,8 @@ func (mysql *Mysql_Conn) Query(sql []byte, rows *MysqlRows) (err error) {
 		err = errors.New("消息大于最大长度" + strconv.Itoa(max_packet_size))
 		return
 	}
-	b := mysql.buffer.Make(5 + len(sql))
+	mysql.writeBuffer.Reset()
+	b := mysql.writeBuffer.Make(5 + len(sql))
 	b[0] = byte(msglen)
 	b[1] = byte(msglen >> 8)
 	b[2] = byte(msglen >> 16)
@@ -211,7 +212,7 @@ func (mysql *Mysql_Conn) Query(sql []byte, rows *MysqlRows) (err error) {
 		mysql.Close()
 		return
 	}
-	mysql.buffer.Reset()
+
 	var errmsg string
 	_, _, rows.field_len, errmsg, err = mysql.readmsg()
 	if errmsg != "" {
@@ -244,7 +245,8 @@ func (mysql *Mysql_Conn) Exec(sql []byte) (lastInsertId int64, rowsAffected int6
 		err = errors.New("消息大于最大长度" + strconv.Itoa(max_packet_size))
 		return
 	}
-	b := mysql.buffer.Make(5 + len(sql))
+	mysql.writeBuffer.Reset()
+	b := mysql.writeBuffer.Make(5 + len(sql))
 	b[0] = byte(msglen)
 	b[1] = byte(msglen >> 8)
 	b[2] = byte(msglen >> 16)
@@ -261,7 +263,6 @@ func (mysql *Mysql_Conn) Exec(sql []byte) (lastInsertId int64, rowsAffected int6
 		mysql.Close()
 		return
 	}
-	mysql.buffer.Reset()
 	rowsAffected, lastInsertId, _, errmsg, err := mysql.readmsg()
 	if errmsg != "" {
 		if strings.Contains(errmsg, "1927-Connection was killed") {
@@ -279,37 +280,22 @@ func (mysql *Mysql_Conn) Exec(sql []byte) (lastInsertId int64, rowsAffected int6
 	return
 }
 
-//一次性读取n个字节
-
-func (mysql *Mysql_Conn) read(need int) error {
-
-	olen := mysql.buffer.Len()
-	n, err := mysql.conn.Read(mysql.buffer.Make(need))
-	if err != nil {
-		mysql.buffer.Truncate(olen)
-		return err
-	}
-	mysql.buffer.Truncate(olen + n)
-
-	return nil
-}
-
 //握手包
 func (mysql *Mysql_Conn) handshakePacket() (err error, seed []byte, seed2 []byte) {
 	conn := mysql.conn
-	mysql.buffer.Reset()
+	mysql.readBuffer.Reset()
 	msglen, err := mysql.readOneMsg()
 	if msglen < 1 || err != nil {
 		err = errors.New(conn.RemoteAddr().String() + "连接数据库失败，获取消息报文长度错误")
 		return
 	}
 
-	switch mysql.buffer.Next(1)[0] {
+	switch mysql.readBuffer.Next(1)[0] {
 	case 10:
 		break
 	case 255:
-		mysql.buffer.Next(1)
-		err = errors.New("连接失败" + mysql.buffer.String())
+		mysql.readBuffer.Next(1)
+		err = errors.New("连接失败" + mysql.readBuffer.String())
 		return
 	default:
 		err = errors.New(conn.RemoteAddr().String() + "连接数据库失败,不支持的协议版本")
@@ -317,19 +303,19 @@ func (mysql *Mysql_Conn) handshakePacket() (err error, seed []byte, seed2 []byte
 	}
 
 	//mysql.Version, err =
-	ReadNullTerminatedString(mysql.buffer)
-	b := mysql.buffer.Next(4)
+	ReadNullTerminatedString(mysql.readBuffer)
+	b := mysql.readBuffer.Next(4)
 	mysql.Thread_id = uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
 
 	seed = make([]byte, 8)
-	_, err = mysql.buffer.Read(seed)
+	_, err = mysql.readBuffer.Read(seed)
 
 	if err != nil {
 		err = errors.New(conn.RemoteAddr().String() + "连接数据库失败,无法获取seed")
 		return
 	}
 
-	mysql.buffer.ReadByte() //读取0x00
+	mysql.readBuffer.ReadByte() //读取0x00
 
 	//mysql.serverCapabilities = binary.LittleEndian.Uint16()
 	//mysql.buffer.Next(8)
@@ -339,24 +325,24 @@ func (mysql *Mysql_Conn) handshakePacket() (err error, seed []byte, seed2 []byte
 
 	//new_connect.restOfScrambleBuff = make([]byte, 13)
 
-	b = mysql.buffer.Next(2)
+	b = mysql.readBuffer.Next(2)
 	mysql.Capabilities = uint32(b[0]) | uint32(b[1])<<8
-	if mysql.buffer.Len() > 0 {
-		mysql.buffer.Shift(3)
-		b = mysql.buffer.Next(2)
+	if mysql.readBuffer.Len() > 0 {
+		mysql.readBuffer.Shift(3)
+		b = mysql.readBuffer.Next(2)
 		mysql.Capabilities |= uint32(b[0])<<16 | uint32(b[1])<<24
-		authlen, _ := mysql.buffer.ReadByte()
+		authlen, _ := mysql.readBuffer.ReadByte()
 
 		if authlen == 0 || authlen != 21 { //seed2长度是authlen-8,  13位，12位值+0值
 			return
 		}
-		mysql.buffer.Shift(10) //读取10个字节
+		mysql.readBuffer.Shift(10) //读取10个字节
 		seed2 = make([]byte, 12)
-		mysql.buffer.Read(seed2)
-		mysql.buffer.Next(1)
+		mysql.readBuffer.Read(seed2)
+		mysql.readBuffer.Next(1)
 		if mysql.Capabilities&CLIENT_PLUGIN_AUTH != 0 {
 
-			if mysql.auth_plugin_name, _ = ReadNullTerminatedString(mysql.buffer); mysql.auth_plugin_name != "mysql_native_password" && mysql.auth_plugin_name != "caching_sha2_password" {
+			if mysql.auth_plugin_name, _ = ReadNullTerminatedString(mysql.readBuffer); mysql.auth_plugin_name != "mysql_native_password" && mysql.auth_plugin_name != "caching_sha2_password" {
 				err = errors.New(conn.RemoteAddr().String() + "连接数据库失败,不支持的密码协议" + mysql.auth_plugin_name + "，期望值是mysql_native_password与caching_sha2_password")
 				return
 			}
@@ -398,32 +384,32 @@ func (mysql *Mysql_Conn) handshakeResponse(seed, seed2 []byte, username, passwd,
 		}
 
 	}
-	mysql.buffer.Reset()
+	mysql.readBuffer.Reset()
 
-	binary.LittleEndian.PutUint32(mysql.buffer.Make(4), capability_flags)
-	binary.LittleEndian.PutUint32(mysql.buffer.Make(4), uint32(max_packet_size))
+	binary.LittleEndian.PutUint32(mysql.readBuffer.Make(4), capability_flags)
+	binary.LittleEndian.PutUint32(mysql.readBuffer.Make(4), uint32(max_packet_size))
 
-	mysql.buffer.WriteByte(clientCharsetIndex)
-	mysql.buffer.Make(23)
+	mysql.readBuffer.WriteByte(clientCharsetIndex)
+	mysql.readBuffer.Make(23)
 
-	WriteNullTerminatedString(mysql.buffer, username)
+	WriteNullTerminatedString(mysql.readBuffer, username)
 
 	if mysql.Capabilities&CLIENT_SECURE_CONNECTION != 0 {
-		Write1lenmsg(mysql.buffer, mysql.prepare_password(seed, seed2, passwd))
+		Write1lenmsg(mysql.readBuffer, mysql.prepare_password(seed, seed2, passwd))
 	} else {
-		WriteNullmsg(mysql.buffer, mysql.prepare_password(seed, seed2, passwd))
+		WriteNullmsg(mysql.readBuffer, mysql.prepare_password(seed, seed2, passwd))
 	}
 
 	if mysql.Capabilities&CLIENT_CONNECT_WITH_DB != 0 {
-		WriteNullTerminatedString(mysql.buffer, database)
+		WriteNullTerminatedString(mysql.readBuffer, database)
 	}
 	if mysql.Capabilities&CLIENT_PLUGIN_AUTH != 0 {
-		WriteNullTerminatedString(mysql.buffer, mysql.auth_plugin_name)
+		WriteNullTerminatedString(mysql.readBuffer, mysql.auth_plugin_name)
 	}
-	msg := make([]byte, mysql.buffer.Len())
-	copy(msg, mysql.buffer.Bytes())
+	msg := make([]byte, mysql.readBuffer.Len())
+	copy(msg, mysql.readBuffer.Bytes())
 	mysql.writemsg(msg)
-	mysql.buffer.Reset()
+	mysql.readBuffer.Reset()
 
 	if mysql.auth_plugin_name == "caching_sha2_password" {
 		msglen, err := mysql.readOneMsg()
@@ -431,12 +417,12 @@ func (mysql *Mysql_Conn) handshakeResponse(seed, seed2 []byte, username, passwd,
 			return err
 		}
 
-		buffer := mysql.buffer.Bytes()[:msglen]
+		buffer := mysql.readBuffer.Bytes()[:msglen]
 		//mysql8这里返回一个0x01 0x03
 		if msglen != 2 || buffer[0] != 1 || buffer[1] != 3 {
 			return errors.New("caching_sha2_password握手返回未知消息包" + fmt.Sprintf("% x", buffer))
 		}
-		mysql.buffer.Next(msglen)
+		mysql.readBuffer.Next(msglen)
 	}
 	_, _, _, errmsg, err := mysql.readmsg()
 	if errmsg != "" {
@@ -454,13 +440,13 @@ func (mysql *Mysql_Conn) handshakeResponse(seed, seed2 []byte, username, passwd,
 }
 func (mysql *Mysql_Conn) handshakeSSL(capability_flags uint32, clientCharsetIndex byte, tlsConfig *tls.Config) error {
 
-	mysql.buffer.Reset()
-	binary.LittleEndian.PutUint32(mysql.buffer.Make(4), capability_flags)
-	binary.LittleEndian.PutUint32(mysql.buffer.Make(4), uint32(max_packet_size))
-	mysql.buffer.WriteByte(clientCharsetIndex)
-	mysql.buffer.Make(23)
-	msg := make([]byte, mysql.buffer.Len())
-	copy(msg, mysql.buffer.Bytes())
+	mysql.writeBuffer.Reset()
+	binary.LittleEndian.PutUint32(mysql.writeBuffer.Make(4), capability_flags)
+	binary.LittleEndian.PutUint32(mysql.writeBuffer.Make(4), uint32(max_packet_size))
+	mysql.writeBuffer.WriteByte(clientCharsetIndex)
+	mysql.writeBuffer.Make(23)
+	msg := make([]byte, mysql.writeBuffer.Len())
+	copy(msg, mysql.writeBuffer.Bytes())
 
 	mysql.writemsg(msg)
 	tconn := tls.Client(mysql.conn, tlsConfig.Clone())
@@ -468,7 +454,7 @@ func (mysql *Mysql_Conn) handshakeSSL(capability_flags uint32, clientCharsetInde
 		return err
 	}
 	mysql.conn = tconn
-	mysql.buffer.Reset()
+
 	return nil
 }
 func (mysql *Mysql_Conn) readmsg() (rowsAffected, lastInsertId int64, result int, errmsg string, err error) {
@@ -477,22 +463,21 @@ func (mysql *Mysql_Conn) readmsg() (rowsAffected, lastInsertId int64, result int
 		return
 	}
 
-	buffer := mysql.buffer.Bytes()[:msglen]
+	buffer := mysql.readBuffer.Next(msglen)
 	switch buffer[0] {
 	case 0: //ok报文
 		var r, l int
-
-		mysql.buffer.Next(1)
-		r, err = ReadLength_Coded_Binary(mysql.buffer)
+		pos := 1
+		r, err = ReadLength_Coded_Slice(buffer[pos:], &pos)
 		if err != nil {
 			return
 		}
-		l, err = ReadLength_Coded_Binary(mysql.buffer)
+		l, err = ReadLength_Coded_Slice(buffer[pos:], &pos)
 		if err != nil {
 			return
 		}
 
-		mysql.buffer.Shift(4)
+		//mysql.readBuffer.Shift(4)
 
 		//mysql.serverStatus = binary.LittleEndian.Uint16(mysql.buffer.Next(2))
 		if err != nil {
@@ -500,45 +485,61 @@ func (mysql *Mysql_Conn) readmsg() (rowsAffected, lastInsertId int64, result int
 		}
 		return int64(r), int64(l), 0, "", nil
 	case 255: //err报文
-
-		mysql.buffer.Next(1)
-		b := mysql.buffer.Next(2)
-		errcode := int(b[0]) | int(b[1])<<8
+		var msg string
+		errcode := int(buffer[1]) | int(buffer[2])<<8
 		if mysql.Status { //未连接成功之前
-			mysql.buffer.Shift(6)
+			msg = string(buffer[9:])
+		} else {
+			msg = string(buffer[3:])
 		}
-		msg, err := ioutil.ReadAll(mysql.buffer)
 		if err != nil {
+
 			return 0, 0, 255, "", err
 		}
+
 		return 0, 0, 255, strconv.Itoa(errcode) + "-" + string(msg), nil
 	case 254: //EOF报文
-
-		mysql.buffer.Shift(5)
 		return 0, 0, 254, "", nil
 	default: //Result Set报文
-		result, err = ReadLength_Coded_Binary(mysql.buffer)
+		pos := 0
+		result, err = ReadLength_Coded_Slice(buffer[pos:], &pos)
 		return
 	}
 	return 0, 0, 0, "", nil
 }
 
+//一次性读取n个字节
+
+func (mysql *Mysql_Conn) read(need int) error {
+
+	olen := mysql.readBuffer.Len()
+	n, err := mysql.conn.Read(mysql.readBuffer.Make(need))
+	if err != nil {
+		mysql.readBuffer.Truncate(olen)
+		return err
+	}
+	mysql.readBuffer.Truncate(olen + n)
+
+	return nil
+}
+
 //至少读一条消息
 func (mysql *Mysql_Conn) readOneMsg() (msglen int, err error) {
 
-	for mysql.buffer.Len() < 4 { //至少包含长度
+	for mysql.readBuffer.Len() < 4 { //至少包含长度
 		err = mysql.read(16384) //读取一定字节
 		if err != nil {
 			return
 		}
 	}
-	b := mysql.buffer.Next(4)
+	b := mysql.readBuffer.Next(4)
 	msglen = int(b[0]) | int(b[1])<<8 | int(b[2])<<16
+
 	if msglen > max_packet_size {
 		return 0, errors.New("EOF")
 	}
-	for mysql.buffer.Len() < msglen { //至少包含一条消息的长度
-		err = mysql.read(msglen - mysql.buffer.Len())
+	for mysql.readBuffer.Len() < msglen { //至少包含一条消息的长度
+		err = mysql.read(msglen - mysql.readBuffer.Len())
 		if err != nil {
 			return 0, err
 		}
@@ -551,17 +552,17 @@ func (mysql *Mysql_Conn) writemsg(msg []byte) error {
 	if msglen > max_packet_size {
 		return errors.New("消息大于最大长度" + strconv.Itoa(max_packet_size))
 	}
-	mysql.buffer.Reset()
-	b := mysql.buffer.Make(3)
+	mysql.writeBuffer.Reset()
+	b := mysql.writeBuffer.Make(3)
 	b[0] = byte(msglen)
 	b[1] = byte(msglen >> 8)
 	b[2] = byte(msglen >> 16)
 	mysql.msg_no++
 
-	mysql.buffer.WriteByte(mysql.msg_no)
-	mysql.buffer.Write(msg)
+	mysql.writeBuffer.WriteByte(mysql.msg_no)
+	mysql.writeBuffer.Write(msg)
 
-	_, err := mysql.conn.Write(mysql.buffer.Bytes())
+	_, err := mysql.conn.Write(mysql.writeBuffer.Bytes())
 	if err != nil {
 		mysql.Status = false
 		mysql.Close()
