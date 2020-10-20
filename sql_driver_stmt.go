@@ -43,8 +43,8 @@ func (conn *Database_mysql_conn) Prepare(query string) (driver.Stmt, error) {
 	}
 	stmt := &Database_mysql_stmt{conn: conn, query: query, ref: 1}
 	if strings.Index(query, "?") == -1 {
-		//stmt.numInput = -1
-		//return stmt, nil
+		stmt.numInput = -1
+		return stmt, nil
 	}
 	var err error
 	sql := Str2bytes(query)
