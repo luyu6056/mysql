@@ -83,24 +83,20 @@ func (row *MysqlRows) Columns(mysql *Mysql_Conn) (err error) {
 
 		row.columns[index].name = string(data[pos : pos+msglen])
 		pos += msglen
-		if err != nil {
-			return err
-		}
 		msglen, err = ReadLength_Coded_Slice(data[pos:], &pos)
 		if err != nil {
 			return
 		}
 		pos += msglen
-		if err != nil {
-			return err
-		}
 		pos += 7
 		row.columns[index].fieldtype = fieldType(data[pos])
 		row.columns[index].fleldflag = fieldFlag(uint16(data[pos+1]) + uint16(data[pos+2])<<8)
 		row.columns[index].decimals = data[pos+3]
 		index++
 	}
-
+	if err != nil {
+		return
+	}
 	return row.ReadResultMsg(mysql)
 }
 func (row *MysqlRows) ReadResultMsg(mysql *Mysql_Conn) (err error) {
