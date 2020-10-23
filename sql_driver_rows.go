@@ -195,7 +195,7 @@ func (rows *Database_rows) Next(dest []driver.Value) (err error) {
 				}
 
 				switch {
-				case msglen == 0:
+				case n == 0:
 					dest[i] = nil
 					continue
 				case columns[i].fieldtype == fieldTypeTime:
