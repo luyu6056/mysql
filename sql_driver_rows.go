@@ -235,7 +235,7 @@ func (rows *Database_rows) Next(dest []driver.Value) (err error) {
 					dest[i], err = formatBinaryDateTime(data[pos:pos+int(n)], dstlen)
 				}
 
-				if err != nil {
+				if err == nil {
 					pos += int(n)
 					continue
 				} else {
