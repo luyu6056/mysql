@@ -94,7 +94,6 @@ func (rows *Database_rows) Next(dest []driver.Value) (err error) {
 		}
 	} else {
 
-		nulllen := (len(dest) + 7 + 2) / 8
 		msglen := rows.r.msg_len[rows.line]
 		data := rows.r.Buffer.Next(msglen)
 
@@ -104,10 +103,10 @@ func (rows *Database_rows) Next(dest []driver.Value) (err error) {
 		if data[0] != 0 {
 			return errors.New("返回协议错误，返回的内容不是Binary Protocol")
 		}
-		pos := 1 + nulllen
-		nullMask := data[1 : 1+pos]
+		pos := 1 + (len(dest)+7+2)>>3
+		nullMask := data[1:pos]
 		for i, _ := range dest {
-			if nullMask[i/8]>>(uint(i)&7) == 1 {
+			if ((nullMask[(i+2)>>3] >> uint((i+2)&7)) & 1) == 1 {
 				dest[i] = nil
 				continue
 			}
@@ -178,11 +177,14 @@ func (rows *Database_rows) Next(dest []driver.Value) (err error) {
 
 				msglen, err := ReadLength_Coded_Slice(data[pos:], &pos)
 				if err != nil {
-
 					return err
 				}
-				dest[i] = string(data[pos : pos+msglen])
 				pos += msglen
+				if msglen == 0 {
+					dest[i] = nil
+				} else {
+					dest[i] = string(data[pos : pos+msglen])
+				}
 			case
 				fieldTypeDate, fieldTypeNewDate, // Date YYYY-MM-DD
 				fieldTypeTime,                         // Time [-][H]HH:MM:SS[.fractal]
@@ -190,7 +192,6 @@ func (rows *Database_rows) Next(dest []driver.Value) (err error) {
 
 				n, err := ReadLength_Coded_Slice(data[pos:], &pos)
 				if err != nil {
-
 					return err
 				}
 
