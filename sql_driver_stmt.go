@@ -16,7 +16,6 @@ var stmtNo uint64
 
 type Database_mysql_stmt struct {
 	query        string
-	name         string
 	conn         *Database_mysql_conn
 	numInput     int
 	lastInsertId int64
@@ -104,7 +103,7 @@ func (conn *Database_mysql_conn) Prepare(query string) (driver.Stmt, error) {
 	return stmt, nil
 }
 func (stmt Database_mysql_stmt) Exec(args []driver.Value) (driver.Result, error) {
-
+	fmt.Println(stmt.query)
 	var err error
 	if stmt.numInput == -1 {
 		stmt.lastInsertId, stmt.rowsAffected, err = stmt.conn.Exec(Str2bytes(stmt.query))
@@ -118,7 +117,7 @@ func (stmt Database_mysql_stmt) Exec(args []driver.Value) (driver.Result, error)
 		}
 
 		var errmsg string
-		stmt.lastInsertId, stmt.rowsAffected, _, errmsg, err = stmt.conn.Mysql_Conn.readmsg()
+		stmt.rowsAffected, stmt.lastInsertId, _, errmsg, err = stmt.conn.Mysql_Conn.readmsg()
 		if errmsg != "" {
 			err = errors.New(errmsg)
 		}
@@ -174,25 +173,14 @@ func (stmt Database_mysql_stmt) Execute(args []driver.Value) error {
 	conn := stmt.conn.Mysql_Conn
 	buf := bufpool.Get().(*MsgBuffer)
 	defer bufpool.Put(buf)
+	argbuf := bufpool.Get().(*MsgBuffer)
+	defer bufpool.Put(argbuf)
 	buf.Reset()
-	data := buf.Make(14)
+	argbuf.Reset()
+	buf.Make(14)
 
-	data[3] = 0
-	data[4] = 23 //StmtExecute
-	data[5] = byte(stmt.id)
-	data[6] = byte(stmt.id >> 8)
-	data[7] = byte(stmt.id >> 16)
-	data[8] = byte(stmt.id >> 24)
-	// flags (0: CURSOR_TYPE_NO_CURSOR) [1 byte]
-	data[9] = 0x00
-
-	// iteration_count (uint32(1)) [4 bytes]
-	data[10] = 0x01
-	data[11] = 0x00
-	data[12] = 0x00
-	data[13] = 0x00
 	if len(args) > 0 {
-		pos := 0
+
 		var nullMask []byte
 		maskLen, typesLen := (len(args)+7)/8, 1+2*len(args)
 		// buffer has to be extended but we don't know by how much so
@@ -202,7 +190,7 @@ func (stmt Database_mysql_stmt) Execute(args []driver.Value) error {
 		data := buf.Make(maskLen + typesLen)
 		nullMask = data[:maskLen]
 		// No need to clean nullMask as make ensures that.
-		pos += maskLen
+		pos := maskLen
 
 		for i := range nullMask {
 			nullMask[i] = 0
@@ -214,7 +202,6 @@ func (stmt Database_mysql_stmt) Execute(args []driver.Value) error {
 
 		// type of each parameter [len(args)*2 bytes]
 		paramTypes := data[pos:]
-		pos += len(args) * 2
 
 		// value of each parameter [n bytes]
 
@@ -233,25 +220,25 @@ func (stmt Database_mysql_stmt) Execute(args []driver.Value) error {
 				paramTypes[i+i] = byte(fieldTypeLongLong)
 				paramTypes[i+i+1] = 0x00
 
-				b := buf.Make(8)
+				b := argbuf.Make(8)
 				uint64ToBytes(uint64(v), b)
 
 			case uint64:
 				paramTypes[i+i] = byte(fieldTypeLongLong)
 				paramTypes[i+i+1] = 0x80 // type is unsigned
-				b := buf.Make(8)
+				b := argbuf.Make(8)
 				uint64ToBytes(v, b)
 			case float64:
 				paramTypes[i+i] = byte(fieldTypeDouble)
 				paramTypes[i+i+1] = 0x00
 
-				b := buf.Make(8)
+				b := argbuf.Make(8)
 				uint64ToBytes(math.Float64bits(v), b)
 
 			case bool:
 				paramTypes[i+i] = byte(fieldTypeTiny)
 				paramTypes[i+i+1] = 0x00
-				b := buf.Make(1)
+				b := argbuf.Make(1)
 				if v {
 					b[0] = 0x01
 				} else {
@@ -265,7 +252,7 @@ func (stmt Database_mysql_stmt) Execute(args []driver.Value) error {
 					paramTypes[i+i+1] = 0x00
 
 					if len(v) < max_packet_size/(stmt.numInput+1) {
-						Writelenmsg(buf, v)
+						Writelenmsg(argbuf, v)
 
 					} else {
 						return errors.New("输入的[]byte数据超过设计数值，请联系作者完善")
@@ -284,7 +271,7 @@ func (stmt Database_mysql_stmt) Execute(args []driver.Value) error {
 				paramTypes[i+i+1] = 0x00
 
 				if len(v) < max_packet_size/(stmt.numInput+1) {
-					Writelenmsg(buf, Str2bytes(v))
+					Writelenmsg(argbuf, Str2bytes(v))
 				} else {
 					return errors.New("输入的[]byte数据超过设计数值，请联系作者完善")
 				}
@@ -294,9 +281,9 @@ func (stmt Database_mysql_stmt) Execute(args []driver.Value) error {
 				paramTypes[i+i+1] = 0x00
 
 				if v.IsZero() {
-					Writelenmsg(buf, Str2bytes("0000-00-00"))
+					Writelenmsg(argbuf, Str2bytes("0000-00-00"))
 				} else {
-					Writelenmsg(buf, Str2bytes(v.In(conn.loc).Format("2006-01-02 15:04:05.999999")))
+					Writelenmsg(argbuf, Str2bytes(v.In(conn.loc).Format("2006-01-02 15:04:05.999999")))
 				}
 
 			default:
@@ -307,11 +294,26 @@ func (stmt Database_mysql_stmt) Execute(args []driver.Value) error {
 		// Check if param values exceeded the available buffer
 		// In that case we must build the data packet with the new values buffer
 	}
+	buf.Write(argbuf.Bytes())
 	msglen := buf.Len() - 4
-	data = buf.Bytes()
+	data := buf.Bytes()
 	data[0] = byte(msglen)
 	data[1] = byte(msglen >> 8)
 	data[2] = byte(msglen >> 16)
+	data[3] = 0
+	data[4] = 23 //StmtExecute
+	data[5] = byte(stmt.id)
+	data[6] = byte(stmt.id >> 8)
+	data[7] = byte(stmt.id >> 16)
+	data[8] = byte(stmt.id >> 24)
+	// flags (0: CURSOR_TYPE_NO_CURSOR) [1 byte]
+	data[9] = 0x00
+
+	// iteration_count (uint32(1)) [4 bytes]
+	data[10] = 0x01
+	data[11] = 0x00
+	data[12] = 0x00
+	data[13] = 0x00
 	_, err = conn.conn.Write(data)
 	return err
 }

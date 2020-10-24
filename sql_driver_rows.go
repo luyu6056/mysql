@@ -179,12 +179,13 @@ func (rows *Database_rows) Next(dest []driver.Value) (err error) {
 				if err != nil {
 					return err
 				}
-				pos += msglen
+
 				if msglen == 0 {
 					dest[i] = nil
 				} else {
 					dest[i] = string(data[pos : pos+msglen])
 				}
+				pos += msglen
 			case
 				fieldTypeDate, fieldTypeNewDate, // Date YYYY-MM-DD
 				fieldTypeTime,                         // Time [-][H]HH:MM:SS[.fractal]

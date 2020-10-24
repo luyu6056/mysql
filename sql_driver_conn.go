@@ -82,7 +82,9 @@ func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
 			}
 		}
 	}
+
 	err := mysqlconn.connect_new(str[1], str[2], str[5], str[6], charset, tlsconfig)
+
 	return &Database_mysql_conn{Mysql_Conn: mysqlconn, stmtCache: make(map[string]*Database_mysql_stmt)}, err
 
 }

@@ -1,12 +1,15 @@
 package mysql
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
-	"fmt"
 	"time"
 
 	//"fmt"
@@ -89,6 +92,11 @@ const (
 	flagUnknown2
 	flagUnknown3
 	flagUnknown4
+)
+const (
+	cachingSha2PasswordRequestPublicKey          = 2
+	cachingSha2PasswordFastAuthSuccess           = 3
+	cachingSha2PasswordPerformFullAuthentication = 4
 )
 
 type Mysql_Conn struct {
@@ -384,45 +392,88 @@ func (mysql *Mysql_Conn) handshakeResponse(seed, seed2 []byte, username, passwd,
 		}
 
 	}
-	mysql.readBuffer.Reset()
+	mysql.writeBuffer.Reset()
 
-	binary.LittleEndian.PutUint32(mysql.readBuffer.Make(4), capability_flags)
-	binary.LittleEndian.PutUint32(mysql.readBuffer.Make(4), uint32(max_packet_size))
+	binary.LittleEndian.PutUint32(mysql.writeBuffer.Make(4), capability_flags)
+	binary.LittleEndian.PutUint32(mysql.writeBuffer.Make(4), uint32(max_packet_size))
 
-	mysql.readBuffer.WriteByte(clientCharsetIndex)
-	mysql.readBuffer.Make(23)
+	mysql.writeBuffer.WriteByte(clientCharsetIndex)
+	mysql.writeBuffer.Make(23)
 
-	WriteNullTerminatedString(mysql.readBuffer, username)
+	WriteNullTerminatedString(mysql.writeBuffer, username)
 
 	if mysql.Capabilities&CLIENT_SECURE_CONNECTION != 0 {
-		Write1lenmsg(mysql.readBuffer, mysql.prepare_password(seed, seed2, passwd))
+		Write1lenmsg(mysql.writeBuffer, mysql.prepare_password(seed, seed2, passwd))
 	} else {
-		WriteNullmsg(mysql.readBuffer, mysql.prepare_password(seed, seed2, passwd))
+		WriteNullmsg(mysql.writeBuffer, mysql.prepare_password(seed, seed2, passwd))
 	}
 
 	if mysql.Capabilities&CLIENT_CONNECT_WITH_DB != 0 {
-		WriteNullTerminatedString(mysql.readBuffer, database)
+		WriteNullTerminatedString(mysql.writeBuffer, database)
 	}
 	if mysql.Capabilities&CLIENT_PLUGIN_AUTH != 0 {
-		WriteNullTerminatedString(mysql.readBuffer, mysql.auth_plugin_name)
+		WriteNullTerminatedString(mysql.writeBuffer, mysql.auth_plugin_name)
 	}
-	msg := make([]byte, mysql.readBuffer.Len())
-	copy(msg, mysql.readBuffer.Bytes())
+	msg := make([]byte, mysql.writeBuffer.Len())
+	copy(msg, mysql.writeBuffer.Bytes())
 	mysql.writemsg(msg)
 	mysql.readBuffer.Reset()
 
 	if mysql.auth_plugin_name == "caching_sha2_password" {
 		msglen, err := mysql.readOneMsg()
+
 		if err != nil {
 			return err
 		}
 
-		buffer := mysql.readBuffer.Bytes()[:msglen]
-		//mysql8这里返回一个0x01 0x03
-		if msglen != 2 || buffer[0] != 1 || buffer[1] != 3 {
-			return errors.New("caching_sha2_password握手返回未知消息包" + fmt.Sprintf("% x", buffer))
+		buffer := mysql.readBuffer.Next(msglen)
+		var pos int
+		l, err := ReadLength_Coded_Slice(buffer, &pos)
+		if err != nil {
+			return err
 		}
-		mysql.readBuffer.Next(msglen)
+		authData := buffer[pos : pos+l]
+		switch len(authData) {
+		case 0:
+			return nil // auth successful
+		case 1:
+			switch authData[0] {
+			case cachingSha2PasswordFastAuthSuccess:
+
+			case cachingSha2PasswordPerformFullAuthentication:
+				/*if mc.cfg.tls != nil || mc.cfg.Net == "unix" {
+					// write cleartext auth packet
+					err = mc.writeAuthSwitchPacket(append([]byte(mc.cfg.Passwd), 0))
+					if err != nil {
+						return err
+					}
+				} else {
+					pubKey := mc.cfg.pubKey
+					if pubKey == nil {*/
+				// request public key from server
+				mysql.writemsg([]byte{cachingSha2PasswordRequestPublicKey})
+				msglen, err := mysql.readOneMsg()
+				if err != nil {
+					return err
+				}
+				data := mysql.readBuffer.Next(msglen)
+				block, _ := pem.Decode(data[1:])
+				pkix, err := x509.ParsePKIXPublicKey(block.Bytes)
+				if err != nil {
+					return err
+				}
+				pubKey := pkix.(*rsa.PublicKey)
+				err = mysql.sendEncryptedPassword(append(seed, seed2...), passwd, pubKey)
+				if err != nil {
+					return err
+				}
+			default:
+				return errors.New("caching_sha2_password密码握手解包错误")
+			}
+		default:
+			return errors.New("caching_sha2_password密码握手解包错误")
+		}
+
 	}
 	_, _, _, errmsg, err := mysql.readmsg()
 	if errmsg != "" {
@@ -468,6 +519,7 @@ func (mysql *Mysql_Conn) readmsg() (rowsAffected, lastInsertId int64, result int
 	case 0: //ok报文
 		var r, l int
 		pos := 1
+
 		r, err = ReadLength_Coded_Slice(buffer[pos:], &pos)
 		if err != nil {
 			return
@@ -480,9 +532,9 @@ func (mysql *Mysql_Conn) readmsg() (rowsAffected, lastInsertId int64, result int
 		//mysql.readBuffer.Shift(4)
 
 		//mysql.serverStatus = binary.LittleEndian.Uint16(mysql.buffer.Next(2))
-		if err != nil {
-			return
-		}
+		//if err != nil {
+		//	return
+		//}
 		return int64(r), int64(l), 0, "", nil
 	case 255: //err报文
 		var msg string
@@ -538,13 +590,14 @@ func (mysql *Mysql_Conn) readOneMsg() (msglen int, err error) {
 	if msglen > max_packet_size {
 		return 0, errors.New("EOF")
 	}
+	mysql.msg_no = b[3]
 	for mysql.readBuffer.Len() < msglen { //至少包含一条消息的长度
 		err = mysql.read(msglen - mysql.readBuffer.Len())
 		if err != nil {
 			return 0, err
 		}
 	}
-	mysql.msg_no = b[3]
+
 	return
 }
 func (mysql *Mysql_Conn) writemsg(msg []byte) error {
@@ -754,6 +807,23 @@ func ReadLengthCodedStringFromBuffer(msg *MsgBuffer, return_str bool) (string, e
 	}
 	msg.Shift(int(msglen))
 	return "", err
+}
+func (mysql *Mysql_Conn) sendEncryptedPassword(seed []byte, password string, pub *rsa.PublicKey) error {
+	enc, err := encryptPassword(password, seed, pub)
+	if err != nil {
+		return err
+	}
+	return mysql.writemsg(enc)
+}
+func encryptPassword(password string, seed []byte, pub *rsa.PublicKey) ([]byte, error) {
+	plain := make([]byte, len(password)+1)
+	copy(plain, password)
+	for i := range plain {
+		j := i % len(seed)
+		plain[i] ^= seed[j]
+	}
+	sha1 := sha1.New()
+	return rsa.EncryptOAEP(sha1, rand.Reader, pub, plain, nil)
 }
 
 var collations = map[string]byte{
