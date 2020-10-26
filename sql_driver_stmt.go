@@ -102,7 +102,7 @@ func (conn *Database_mysql_conn) Prepare(query string) (driver.Stmt, error) {
 	conn.stmtCache[query] = stmt
 	return stmt, nil
 }
-func (stmt Database_mysql_stmt) Exec(args []driver.Value) (driver.Result, error) {
+func (stmt *Database_mysql_stmt) Exec(args []driver.Value) (driver.Result, error) {
 	fmt.Println(stmt.query)
 	var err error
 	if stmt.numInput == -1 {
@@ -167,7 +167,7 @@ func (stmt *Database_mysql_stmt) Query(args []driver.Value) (driver.Rows, error)
 
 	return &Database_rows{r: row, stmt: stmt}, err
 }
-func (stmt Database_mysql_stmt) Execute(args []driver.Value) error {
+func (stmt *Database_mysql_stmt) Execute(args []driver.Value) error {
 
 	var err error
 	conn := stmt.conn.Mysql_Conn
@@ -320,7 +320,7 @@ func (stmt Database_mysql_stmt) Execute(args []driver.Value) error {
 func (stmt Database_mysql_stmt) NumInput() int {
 	return stmt.numInput
 }
-func (stmt Database_mysql_stmt) Close() (err error) {
+func (stmt *Database_mysql_stmt) Close() (err error) {
 	if stmt.numInput == -1 {
 		return
 	}
