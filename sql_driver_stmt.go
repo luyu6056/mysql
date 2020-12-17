@@ -103,7 +103,6 @@ func (conn *Database_mysql_conn) Prepare(query string) (driver.Stmt, error) {
 	return stmt, nil
 }
 func (stmt *Database_mysql_stmt) Exec(args []driver.Value) (driver.Result, error) {
-	fmt.Println(stmt.query)
 	var err error
 	if stmt.numInput == -1 {
 		stmt.lastInsertId, stmt.rowsAffected, err = stmt.conn.Exec(Str2bytes(stmt.query))

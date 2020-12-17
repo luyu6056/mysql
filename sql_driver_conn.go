@@ -117,11 +117,11 @@ type Database_mysql_tx struct {
 	*Mysql_Conn
 }
 
-func (tx Database_mysql_tx) Commit() error {
+func (tx *Database_mysql_tx) Commit() error {
 	_, _, err := tx.Exec([]byte{99, 111, 109, 109, 105, 116})
 	return err
 }
-func (tx Database_mysql_tx) Rollback() error {
+func (tx *Database_mysql_tx) Rollback() error {
 	_, _, err := tx.Exec([]byte{114, 111, 108, 108, 98, 97, 99, 107})
 	return err
 }
