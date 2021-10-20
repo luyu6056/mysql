@@ -323,7 +323,7 @@ func (mysql *Mysql_Conn) handshakePacket() (err error, seed []byte, seed2 []byte
 		return
 	}
 
-	mysql.readBuffer.ReadByte() //读取0x00
+	mysql.readBuffer.Next(1) //读取0x00
 
 	//mysql.serverCapabilities = binary.LittleEndian.Uint16()
 	//mysql.buffer.Next(8)
@@ -339,21 +339,29 @@ func (mysql *Mysql_Conn) handshakePacket() (err error, seed []byte, seed2 []byte
 		mysql.readBuffer.Shift(3)
 		b = mysql.readBuffer.Next(2)
 		mysql.Capabilities |= uint32(b[0])<<16 | uint32(b[1])<<24
-		authlen, _ := mysql.readBuffer.ReadByte()
-
-		if authlen == 0 || authlen != 21 { //seed2长度是authlen-8,  13位，12位值+0值
-			return
+		
+		if mysql.Capabilities&CLIENT_PLUGIN_AUTH != 0 {
+			authlen, _ := mysql.readBuffer.ReadByte()
+			if authlen == 0 || authlen != 21 { //seed2长度是authlen-8,  13位，12位值+0值
+				return
+			}
+		} else {
+			mysql.readBuffer.ReadByte() //读取0x00
 		}
 		mysql.readBuffer.Shift(10) //读取10个字节
-		seed2 = make([]byte, 12)
-		mysql.readBuffer.Read(seed2)
-		mysql.readBuffer.Next(1)
+		if mysql.Capabilities&CLIENT_SECURE_CONNECTION != 0 {
+			seed2 = make([]byte, 12)
+			mysql.readBuffer.Read(seed2)
+			mysql.readBuffer.Next(1)
+		}
 		if mysql.Capabilities&CLIENT_PLUGIN_AUTH != 0 {
 
 			if mysql.auth_plugin_name, _ = ReadNullTerminatedString(mysql.readBuffer); mysql.auth_plugin_name != "mysql_native_password" && mysql.auth_plugin_name != "caching_sha2_password" {
 				err = errors.New(conn.RemoteAddr().String() + "连接数据库失败,不支持的密码协议" + mysql.auth_plugin_name + "，期望值是mysql_native_password与caching_sha2_password")
 				return
 			}
+		} else {
+			mysql.auth_plugin_name = "mysql_native_password"
 		}
 
 	}
@@ -362,6 +370,7 @@ func (mysql *Mysql_Conn) handshakePacket() (err error, seed []byte, seed2 []byte
 		err = errors.New(conn.RemoteAddr().String() + "连接数据库失败,服务器版本太旧，不支持4.1协议")
 		return
 	}
+
 
 	//mysql.buffer.Read(make([]byte, 1)) //读取0x00
 	//mysql.auth_plugin_name, _ = ReadNullTerminatedString(mysql.buffer)
