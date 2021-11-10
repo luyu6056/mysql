@@ -110,7 +110,7 @@ func (conn *Database_mysql_conn) Begin() (driver.Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Database_mysql_tx{conn.Mysql_Conn}, nil
+	return &Database_mysql_tx{conn.Mysql_Conn}, nil
 }
 
 type Database_mysql_tx struct {
